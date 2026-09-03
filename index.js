@@ -12,12 +12,12 @@ const client = new Client({
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   },
-  // Pin a known-stable WhatsApp Web version — the latest auto-fetched
-  // version sometimes breaks pairing codes.
+  // Pin a known-stable WhatsApp Web version — newer/alpha versions
+  // break pairing codes with an internal "Evaluation failed" error.
   webVersionCache: {
     type: 'remote',
     remotePath:
-      'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023537762-alpha.html',
+      'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
   },
 });
 
