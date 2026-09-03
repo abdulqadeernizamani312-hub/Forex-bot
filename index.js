@@ -44,7 +44,11 @@ client.on('qr', async () => {
     console.log('================================');
     console.log('WhatsApp app kholo > Linked Devices > Link with phone number > ye code enter karo (1-2 min ke andar).');
   } catch (err) {
-    console.log('Pairing code error (attempt ' + pairingAttempts + '/' + MAX_ATTEMPTS + '):', err.message);
+    console.log('Pairing code error (attempt ' + pairingAttempts + '/' + MAX_ATTEMPTS + ')');
+    console.log('  name:', err && err.name);
+    console.log('  message:', err && err.message);
+    console.log('  string:', String(err));
+    console.log('  stack:', err && err.stack);
     // 10 second cooldown se pehle dobara try karne do, taake spam/rate-limit na ho
     setTimeout(() => {
       pairingRequested = false;
