@@ -12,16 +12,24 @@ const client = new Client({
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   },
+  // Pin a known-stable WhatsApp Web version.
+  // Fixes "Invariant Violation #6748" that breaks pairing codes on some
+  // auto-fetched WhatsApp Web versions.
+  webVersionCache: {
+    type: 'remote',
+    remotePath:
+      'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023537762-alpha.html',
+  },
 });
 
 let pairingRequested = false;
 
-client.on('qr', async () => {
+client.on('qr', async (qr) => {
   if (!PAIRING_NUMBER) {
-    console.log('PAIRING_NUMBER env variable set nahi hai. Railway Variables mein PAIRING_NUMBER add karo (e.g. 923001234567).');
+    console.log('PAIRING_NUMBER not set — cannot request a pairing code.');
     return;
   }
-  if (pairingRequested) return; // only ask once
+  if (pairingRequested) return; // only ask once per run
   pairingRequested = true;
   try {
     const code = await client.requestPairingCode(PAIRING_NUMBER);
@@ -31,6 +39,7 @@ client.on('qr', async () => {
     console.log('WhatsApp app kholo > Linked Devices > Link with phone number > ye code enter karo.');
   } catch (err) {
     console.log('Pairing code error:', err.message);
+    pairingRequested = false; // allow retry on next qr refresh
   }
 });
 
@@ -38,10 +47,17 @@ client.on('ready', () => {
   console.log('✅ Bot is ready and connected to WhatsApp!');
 });
 
+client.on('auth_failure', (msg) => {
+  console.log('❌ Auth failure:', msg);
+});
+
+client.on('disconnected', (reason) => {
+  console.log('⚠️ Disconnected:', reason);
+});
+
 client.on('message', async (msg) => {
   const from = msg.from.replace('@c.us', '');
 
-  // Optional: restrict to your own number only
   if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) return;
 
   const text = msg.body.trim();
