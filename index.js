@@ -12,9 +12,8 @@ const client = new Client({
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   },
-  // Pin a known-stable WhatsApp Web version.
-  // Fixes "Invariant Violation #6748" that breaks pairing codes on some
-  // auto-fetched WhatsApp Web versions.
+  // Pin a known-stable WhatsApp Web version — the latest auto-fetched
+  // version sometimes breaks pairing codes.
   webVersionCache: {
     type: 'remote',
     remotePath:
@@ -23,23 +22,33 @@ const client = new Client({
 });
 
 let pairingRequested = false;
+let pairingAttempts = 0;
+const MAX_ATTEMPTS = 3;
 
-client.on('qr', async (qr) => {
+client.on('qr', async () => {
   if (!PAIRING_NUMBER) {
-    console.log('PAIRING_NUMBER not set — cannot request a pairing code.');
+    console.log('PAIRING_NUMBER env variable set nahi hai. Railway Variables mein PAIRING_NUMBER add karo (e.g. 923001234567).');
     return;
   }
-  if (pairingRequested) return; // only ask once per run
+  if (pairingRequested) return; // ek waqt mein sirf ek request chalne do
+  if (pairingAttempts >= MAX_ATTEMPTS) {
+    console.log('❌ Max pairing attempts reached is run mein. Container ko restart karo aur 5+ minute wait karke try karo (rate limit se bachne ke liye).');
+    return;
+  }
   pairingRequested = true;
+  pairingAttempts++;
   try {
     const code = await client.requestPairingCode(PAIRING_NUMBER);
     console.log('================================');
     console.log('WHATSAPP PAIRING CODE:', code);
     console.log('================================');
-    console.log('WhatsApp app kholo > Linked Devices > Link with phone number > ye code enter karo.');
+    console.log('WhatsApp app kholo > Linked Devices > Link with phone number > ye code enter karo (1-2 min ke andar).');
   } catch (err) {
-    console.log('Pairing code error:', err.message);
-    pairingRequested = false; // allow retry on next qr refresh
+    console.log('Pairing code error (attempt ' + pairingAttempts + '/' + MAX_ATTEMPTS + '):', err.message);
+    // 10 second cooldown se pehle dobara try karne do, taake spam/rate-limit na ho
+    setTimeout(() => {
+      pairingRequested = false;
+    }, 10000);
   }
 });
 
@@ -58,6 +67,7 @@ client.on('disconnected', (reason) => {
 client.on('message', async (msg) => {
   const from = msg.from.replace('@c.us', '');
 
+  // Optional: restrict to your own number only
   if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) return;
 
   const text = msg.body.trim();
