@@ -1,6 +1,5 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const { analyzePair } = require('./analysis');
 
 const ALLOWED_NUMBER = process.env.ALLOWED_NUMBER; // e.g. 923001234567
@@ -17,11 +16,9 @@ const client = new Client({
 
 let pairingRequested = false;
 
-client.on('qr', async (qr) => {
+client.on('qr', async () => {
   if (!PAIRING_NUMBER) {
-    // Fallback: no PAIRING_NUMBER set, so show QR as before
-    console.log('Scan this QR code with WhatsApp (Linked Devices):');
-    qrcode.generate(qr, { small: true });
+    console.log('PAIRING_NUMBER env variable set nahi hai. Railway Variables mein PAIRING_NUMBER add karo (e.g. 923001234567).');
     return;
   }
   if (pairingRequested) return; // only ask once
