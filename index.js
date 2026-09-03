@@ -1,14 +1,10 @@
 require('dotenv').config();
-const express = require('express');
-const QRCode = require('qrcode');
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
 const { analyzePair } = require('./analysis');
 
 const ALLOWED_NUMBER = process.env.ALLOWED_NUMBER; // e.g. 923001234567
-const PORT = process.env.PORT || 3000;
-
-let currentQR = null;
-let botStatus = 'starting'; // starting | qr | ready
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER; // your WhatsApp number, e.g. 923001234567 (no +, no spaces)
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -19,21 +15,36 @@ const client = new Client({
   },
 });
 
-client.on('qr', (qr) => {
-  currentQR = qr;
-  botStatus = 'qr';
-  console.log('QR code updated — open the web URL to scan it.');
+let pairingRequested = false;
+
+client.on('qr', async (qr) => {
+  if (!PAIRING_NUMBER) {
+    // Fallback: no PAIRING_NUMBER set, so show QR as before
+    console.log('Scan this QR code with WhatsApp (Linked Devices):');
+    qrcode.generate(qr, { small: true });
+    return;
+  }
+  if (pairingRequested) return; // only ask once
+  pairingRequested = true;
+  try {
+    const code = await client.requestPairingCode(PAIRING_NUMBER);
+    console.log('================================');
+    console.log('WHATSAPP PAIRING CODE:', code);
+    console.log('================================');
+    console.log('WhatsApp app kholo > Linked Devices > Link with phone number > ye code enter karo.');
+  } catch (err) {
+    console.log('Pairing code error:', err.message);
+  }
 });
 
 client.on('ready', () => {
-  botStatus = 'ready';
-  currentQR = null;
   console.log('✅ Bot is ready and connected to WhatsApp!');
 });
 
 client.on('message', async (msg) => {
   const from = msg.from.replace('@c.us', '');
 
+  // Optional: restrict to your own number only
   if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) return;
 
   const text = msg.body.trim();
@@ -63,30 +74,3 @@ client.on('message', async (msg) => {
 });
 
 client.initialize();
-
-// ---- Tiny web server just to show the QR code ----
-const app = express();
-
-app.get('/', async (req, res) => {
-  if (botStatus === 'ready') {
-    return res.send('<h2>✅ Bot is connected and running!</h2><p>You can close this page.</p>');
-  }
-  if (botStatus === 'qr' && currentQR) {
-    const dataUrl = await QRCode.toDataURL(currentQR);
-    return res.send(`
-      <html>
-        <body style="text-align:center; font-family: sans-serif; padding-top: 40px;">
-          <h2>Scan this QR code with WhatsApp</h2>
-          <p>WhatsApp &gt; Settings &gt; Linked Devices &gt; Link a Device</p>
-          <img src="${dataUrl}" style="width:300px;height:300px;" />
-          <p><small>Refresh this page if the code expires.</small></p>
-        </body>
-      </html>
-    `);
-  }
-  return res.send('<h2>⏳ Starting up... refresh in a few seconds.</h2>');
-});
-
-app.listen(PORT, () => {
-  console.log(`Web server running on port ${PORT}`);
-});
