@@ -67,9 +67,25 @@ client.on('disconnected', (reason) => {
 });
 
 client.on('message', async (msg) => {
-  const from = msg.from.replace('@c.us', '');
+  let from = msg.from.replace('@c.us', '').replace('@lid', '');
 
-  console.log('📩 Message received from:', from, '| ALLOWED_NUMBER is:', ALLOWED_NUMBER, '| text:', msg.body);
+  // WhatsApp sometimes sends a LID (privacy id) instead of the real number.
+  // Resolve it via the contact object to get the actual phone number.
+  if (msg.from.endsWith('@lid')) {
+    try {
+      const contact = await msg.getContact();
+      if (contact && contact.number) {
+        from = contact.number;
+      }
+    } catch (e) {
+      console.log('LID resolve karne mein error:', e.message);
+    }
+  }
+
+  // Ignore WhatsApp status broadcasts
+  if (msg.from === 'status@broadcast') return;
+
+  console.log('📩 Message received from:', from, '(raw:', msg.from, ') | ALLOWED_NUMBER is:', ALLOWED_NUMBER, '| text:', msg.body);
 
   // Optional: restrict to your own number only
   if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) {
