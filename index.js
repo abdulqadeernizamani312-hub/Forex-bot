@@ -1,41 +1,9 @@
 require('dotenv').config();
-const express = require('express');
-const QRCode = require('qrcode');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { analyzePair } = require('./analysis');
 
 const ALLOWED_NUMBER = process.env.ALLOWED_NUMBER; // e.g. 923001234567
-const PORT = process.env.PORT || 3000;
-
-let latestQrDataUrl = null;
-let isReady = false;
-
-const app = express();
-
-app.get('/qr', (req, res) => {
-  if (isReady) {
-    res.send('<h2>✅ Bot already connected. No QR needed.</h2>');
-    return;
-  }
-  if (!latestQrDataUrl) {
-    res.send('<h2>QR abhi generate nahi hua. 10-15 second baad refresh karo.</h2>');
-    return;
-  }
-  res.send(`
-    <html>
-      <body style="text-align:center; font-family:sans-serif; padding-top:40px;">
-        <h2>WhatsApp se QR scan karo</h2>
-        <img src="${latestQrDataUrl}" style="width:300px; height:300px;" />
-        <p>WhatsApp app kholo &gt; Linked Devices &gt; Link a device &gt; ye QR scan karo</p>
-        <p>QR expire ho jaye to page refresh karo.</p>
-      </body>
-    </html>
-  `);
-});
-
-app.listen(PORT, () => {
-  console.log(`QR page live hai: apna Railway public URL + /qr par jao (e.g. https://<your-app>.up.railway.app/qr)`);
-});
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER; // your WhatsApp number, e.g. 923001234567 (no +, no spaces)
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -44,6 +12,8 @@ const client = new Client({
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   },
+  // Pin a known-stable WhatsApp Web version — newer/alpha versions
+  // break pairing codes with an internal "Evaluation failed" error.
   webVersionCache: {
     type: 'remote',
     remotePath:
@@ -51,17 +21,40 @@ const client = new Client({
   },
 });
 
-client.on('qr', async (qr) => {
+let pairingRequested = false;
+let pairingAttempts = 0;
+const MAX_ATTEMPTS = 2; // kam rakha hai taake dobara rate-limit na lage
+
+client.on('qr', async () => {
+  if (!PAIRING_NUMBER) {
+    console.log('PAIRING_NUMBER env variable set nahi hai. Railway Variables mein PAIRING_NUMBER add karo (e.g. 923001234567).');
+    return;
+  }
+  if (pairingRequested) return;
+  if (pairingAttempts >= MAX_ATTEMPTS) {
+    console.log('❌ Max pairing attempts reached is run mein. Agar phir bhi rate-limit error aaye, kai ghante wait karke dobara try karna.');
+    return;
+  }
+  pairingRequested = true;
+  pairingAttempts++;
   try {
-    latestQrDataUrl = await QRCode.toDataURL(qr);
-    console.log('Naya QR ready hai. Apne Railway public URL ke aage /qr lagao aur browser mein kholo.');
+    const code = await client.requestPairingCode(PAIRING_NUMBER);
+    console.log('================================');
+    console.log('WHATSAPP PAIRING CODE:', code);
+    console.log('================================');
+    console.log('WhatsApp app kholo > Linked Devices > Link with phone number > ye code TURANT (30-60 sec ke andar) enter karo.');
   } catch (err) {
-    console.log('QR generate karne mein error:', err.message);
+    console.log('Pairing code error (attempt ' + pairingAttempts + '/' + MAX_ATTEMPTS + ')');
+    console.log('  name:', err && err.name);
+    console.log('  message:', err && err.message);
+    console.log('  string:', String(err));
+    setTimeout(() => {
+      pairingRequested = false;
+    }, 15000);
   }
 });
 
 client.on('ready', () => {
-  isReady = true;
   console.log('✅ Bot is ready and connected to WhatsApp!');
 });
 
