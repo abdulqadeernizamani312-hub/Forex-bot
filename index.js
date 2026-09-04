@@ -1,6 +1,8 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const { analyzePair, quickSignal } = require('./analysis');
+const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis } = require('./analysis');
+
+const startTime = Date.now();
 
 const ALLOWED_NUMBER = process.env.ALLOWED_NUMBER; // e.g. 923001234567
 const PAIRING_NUMBER = process.env.PAIRING_NUMBER; // your WhatsApp number, e.g. 923001234567 (no +, no spaces)
@@ -88,10 +90,49 @@ client.on('message', async (msg) => {
     await msg.reply(
       '*Forex Analysis Bot*\n\n' +
       'Commands:\n' +
+      '!status - bot online hai ya nahi, check karo\n' +
       '!analyze EURUSD - detailed multi-timeframe analysis (hours/days ke liye)\n' +
-      '!signal EURUSD - quick UP/DOWN guess (5-min, short expiry ke liye)\n\n' +
+      '!full EURUSD - poori history, har timeframe pe pattern analysis\n' +
+      '!signal EURUSD - quick UP/DOWN guess (5-min, short expiry ke liye)\n' +
+      '!predict EURUSD - 1 se 60 minute tak har duration ka history-based stat\n\n' +
       'Supported shortcuts: EURUSD, GBPUSD, USDJPY, USDPKR, USDINR, AUDUSD, USDCAD, USDCHF, NZDUSD, EURGBP, XAUUSD'
     );
+    return;
+  }
+
+  if (text.toLowerCase() === '!status') {
+    const uptimeMin = Math.floor((Date.now() - startTime) / 60000);
+    await msg.reply(
+      '✅ Bot online hai aur WhatsApp se connected hai.\n' +
+      `Uptime: ${uptimeMin} minute\n\n` +
+      'Commands ke liye !help bhejo.'
+    );
+    return;
+  }
+
+  const fullMatch = text.match(/^!full\s+(\S+)/i);
+  if (fullMatch) {
+    const pair = fullMatch[1];
+    try {
+      await msg.reply('⏳ Poori history fetch aur analyze ho rahi hai ' + pair.toUpperCase() + '... (thoda time lagega)');
+      const result = await fullHistoryAnalysis(pair);
+      await msg.reply(result);
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
+    }
+    return;
+  }
+
+  const predictMatch = text.match(/^!predict\s+(\S+)/i);
+  if (predictMatch) {
+    const pair = predictMatch[1];
+    try {
+      await msg.reply('⏳ Multi-duration prediction fetch ho raha hai ' + pair.toUpperCase() + '... (thoda time lagega)');
+      const result = await predictAllDurations(pair);
+      await msg.reply(result);
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
+    }
     return;
   }
 
