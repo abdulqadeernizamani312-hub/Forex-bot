@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const { analyzePair } = require('./analysis');
+const { analyzePair, quickSignal } = require('./analysis');
 
 const ALLOWED_NUMBER = process.env.ALLOWED_NUMBER; // e.g. 923001234567
 const PAIRING_NUMBER = process.env.PAIRING_NUMBER; // your WhatsApp number, e.g. 923001234567 (no +, no spaces)
@@ -68,28 +68,17 @@ client.on('disconnected', (reason) => {
 
 client.on('message', async (msg) => {
   let from = msg.from.replace('@c.us', '').replace('@lid', '');
-
-  // WhatsApp sometimes sends a LID (privacy id) instead of the real number.
-  // Resolve it via the contact object to get the actual phone number.
-  if (msg.from.endsWith('@lid')) {
-    try {
-      const contact = await msg.getContact();
-      if (contact && contact.number) {
-        from = contact.number;
-      }
-    } catch (e) {
-      console.log('LID resolve karne mein error:', e.message);
-    }
-  }
+  const rawLid = msg.from.endsWith('@lid') ? msg.from.replace('@lid', '') : null;
 
   // Ignore WhatsApp status broadcasts
   if (msg.from === 'status@broadcast') return;
 
   console.log('📩 Message received from:', from, '(raw:', msg.from, ') | ALLOWED_NUMBER is:', ALLOWED_NUMBER, '| text:', msg.body);
 
-  // Optional: restrict to your own number only
-  if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) {
-    console.log('   -> Ignored (number does not match ALLOWED_NUMBER)');
+  // Optional: restrict to your own number/LID only
+  const isAllowed = !ALLOWED_NUMBER || from === ALLOWED_NUMBER || rawLid === ALLOWED_NUMBER;
+  if (!isAllowed) {
+    console.log('   -> Ignored (number/LID does not match ALLOWED_NUMBER)');
     return;
   }
 
@@ -99,10 +88,23 @@ client.on('message', async (msg) => {
     await msg.reply(
       '*Forex Analysis Bot*\n\n' +
       'Commands:\n' +
-      '!analyze EURUSD - get technical analysis for a pair\n' +
-      '!analyze XAUUSD - gold vs USD\n\n' +
+      '!analyze EURUSD - detailed multi-timeframe analysis (hours/days ke liye)\n' +
+      '!signal EURUSD - quick UP/DOWN guess (5-min, short expiry ke liye)\n\n' +
       'Supported shortcuts: EURUSD, GBPUSD, USDJPY, USDPKR, USDINR, AUDUSD, USDCAD, USDCHF, NZDUSD, EURGBP, XAUUSD'
     );
+    return;
+  }
+
+  const signalMatch = text.match(/^!signal\s+(\S+)/i);
+  if (signalMatch) {
+    const pair = signalMatch[1];
+    try {
+      await msg.reply('⏳ Quick signal fetch ho raha hai ' + pair.toUpperCase() + '...');
+      const result = await quickSignal(pair);
+      await msg.reply(result);
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
+    }
     return;
   }
 
