@@ -69,8 +69,13 @@ client.on('disconnected', (reason) => {
 client.on('message', async (msg) => {
   const from = msg.from.replace('@c.us', '');
 
+  console.log('📩 Message received from:', from, '| ALLOWED_NUMBER is:', ALLOWED_NUMBER, '| text:', msg.body);
+
   // Optional: restrict to your own number only
-  if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) return;
+  if (ALLOWED_NUMBER && from !== ALLOWED_NUMBER) {
+    console.log('   -> Ignored (number does not match ALLOWED_NUMBER)');
+    return;
+  }
 
   const text = msg.body.trim();
 
