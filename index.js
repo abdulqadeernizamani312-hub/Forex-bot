@@ -1,8 +1,59 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, isForexMarketLikelyClosed, fetchQuote, getKeyLevelsWithStats, backtestMethod, crossPairConfirmation } = require('./analysis');
+const axios = require('axios');
 
 const startTime = Date.now();
+
+// ---- Persistent storage (Upstash Redis REST API) ----
+// Free tier, no Volume needed — just a URL + token from upstash.com.
+// If these env vars aren't set, the bot falls back to in-memory (resets on restart).
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const PERSISTENCE_ENABLED = Boolean(REDIS_URL && REDIS_TOKEN);
+
+async function redisGet(key) {
+  if (!PERSISTENCE_ENABLED) return null;
+  try {
+    const { data } = await axios.get(`${REDIS_URL}/get/${key}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    return data.result ? JSON.parse(data.result) : null;
+  } catch (e) {
+    console.log('⚠️ Redis GET failed:', e.message);
+    return null;
+  }
+}
+
+async function redisSet(key, value) {
+  if (!PERSISTENCE_ENABLED) return;
+  try {
+    await axios.post(`${REDIS_URL}/set/${key}`, JSON.stringify(value), {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'text/plain' },
+    });
+  } catch (e) {
+    console.log('⚠️ Redis SET failed:', e.message);
+  }
+}
+
+// In-memory cache of the prediction log — loaded from Redis at startup (if
+// configured), kept in sync on every mutation. Falls back to pure in-memory
+// (resets on restart) if Redis env vars aren't set.
+let predictionLog = [];
+(async () => {
+  if (PERSISTENCE_ENABLED) {
+    const saved = await redisGet('prediction_log');
+    if (saved) predictionLog = saved;
+    console.log(`📦 Persistent storage ON — loaded ${predictionLog.length} past predictions.`);
+  } else {
+    console.log('📦 Persistent storage OFF — UPSTASH_REDIS_REST_URL/TOKEN not set. Track record will reset on restart.');
+  }
+})();
+
+async function savePredictionLog() {
+  if (predictionLog.length > 5000) predictionLog = predictionLog.slice(-5000);
+  await redisSet('prediction_log', predictionLog);
+}
 
 // Chat to send proactive level-hit alerts to — captured from the first
 // allowed message we receive (avoids @c.us vs @lid addressing issues).
@@ -16,7 +67,7 @@ const PAIRING_NUMBER = process.env.PAIRING_NUMBER; // your WhatsApp number, e.g.
 
 // In-memory track record of !signal predictions. Resets on restart (no
 // persistent storage set up) but still useful for "since last restart" stats.
-const predictionLog = [];
+// (persistent predictionLog declared above near Redis helpers)
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -67,7 +118,10 @@ client.on('qr', async () => {
   }
 });
 
+let hasBeenReady = false;
+
 client.on('ready', () => {
+  hasBeenReady = true;
   console.log('✅ Bot is ready and connected to WhatsApp!');
 });
 
@@ -77,14 +131,21 @@ client.on('auth_failure', (msg) => {
 
 client.on('disconnected', (reason) => {
   console.log('⚠️ Disconnected:', reason);
-  process.exit(1);
+  if (hasBeenReady) {
+    // Only force-restart if we had a working connection that then broke.
+    // During initial pairing, disconnect-like events are normal — don't kill
+    // the process before the user has a chance to enter the pairing code.
+    process.exit(1);
+  }
 });
 
 // Watchdog: whatsapp-web.js can silently lose its connection without ever
 // firing the 'disconnected' event. Every 3 minutes, actively ask the client
-// for its real state; if it's not CONNECTED, restart the process — Railway's
-// restart policy will spin up a fresh container automatically.
+// for its real state; if it's not CONNECTED, restart the process — but ONLY
+// once we've successfully connected at least once (otherwise this would
+// kill the process mid-pairing, before the user can enter the code).
 setInterval(async () => {
+  if (!hasBeenReady) return; // still waiting on initial pairing — don't interfere
   try {
     const state = await Promise.race([
       client.getState(),
@@ -119,12 +180,15 @@ setInterval(async () => {
     }
   }
 
+  let anyEvaluated = false;
   for (const p of due) {
     if (prices[p.symbol] === undefined) continue;
     p.evaluated = true;
     p.exitPrice = prices[p.symbol];
     p.correct = p.direction === 'UP' ? prices[p.symbol] > p.entryPrice : prices[p.symbol] < p.entryPrice;
+    anyEvaluated = true;
   }
+  if (anyEvaluated) await savePredictionLog();
 }, 5 * 60 * 1000);
 
 // Every 2 minutes, check watched price levels. If price is close to a
@@ -296,21 +360,22 @@ client.on('message', async (msg) => {
   if (text.toLowerCase() === '!accuracy') {
     const evaluated = predictionLog.filter(p => p.evaluated);
     const pending = predictionLog.filter(p => !p.evaluated);
+    const persistenceNote = PERSISTENCE_ENABLED
+      ? 'Ye permanent record hai — restart hone par bhi safe rahega.'
+      : 'Note: Permanent storage set up nahi hai (UPSTASH_REDIS_REST_URL/TOKEN missing) — restart hone par ye data reset ho jayega.';
     if (evaluated.length === 0) {
       await msg.reply(
         `Abhi tak koi !signal prediction matured nahi hui (evaluate hone mein 15 minute lagte hain).\n` +
-        `Pending: ${pending.length}\n\n` +
-        `Note: Ye track record sirf is bot session ke liye hai — restart hone par reset ho jata hai.`
+        `Pending: ${pending.length}\n\n${persistenceNote}`
       );
       return;
     }
     const correct = evaluated.filter(p => p.correct).length;
     const pct = Math.round((correct / evaluated.length) * 100);
     await msg.reply(
-      `*Bot's Track Record (this session)*\n\n` +
+      `*Bot's Track Record*\n\n` +
       `${correct}/${evaluated.length} correct (${pct}%)\n` +
-      `Pending evaluation: ${pending.length}\n\n` +
-      `Note: Ye sirf is bot session ka data hai (restart hone par reset ho jata hai — permanent storage abhi set up nahi hai). Chhota sample abhi ho sakta hai, isliye is number ko bhi ehtiyaat se lena.`
+      `Pending evaluation: ${pending.length}\n\n${persistenceNote}`
     );
     return;
   }
@@ -369,8 +434,7 @@ client.on('message', async (msg) => {
           createdAt: Date.now(),
           evaluated: false,
         });
-        // keep the log from growing unbounded
-        if (predictionLog.length > 500) predictionLog.splice(0, predictionLog.length - 500);
+        await savePredictionLog();
       }
     } catch (err) {
       await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
