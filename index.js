@@ -1,11 +1,22 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis } = require('./analysis');
+const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, isForexMarketLikelyClosed, fetchQuote, getKeyLevelsWithStats, backtestMethod, crossPairConfirmation } = require('./analysis');
 
 const startTime = Date.now();
 
+// Chat to send proactive level-hit alerts to — captured from the first
+// allowed message we receive (avoids @c.us vs @lid addressing issues).
+let notifyChatId = null;
+
+// Levels the bot is actively watching. Resets on restart.
+const watchList = [];
+
 const ALLOWED_NUMBER = process.env.ALLOWED_NUMBER; // e.g. 923001234567
 const PAIRING_NUMBER = process.env.PAIRING_NUMBER; // your WhatsApp number, e.g. 923001234567 (no +, no spaces)
+
+// In-memory track record of !signal predictions. Resets on restart (no
+// persistent storage set up) but still useful for "since last restart" stats.
+const predictionLog = [];
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -66,18 +77,111 @@ client.on('auth_failure', (msg) => {
 
 client.on('disconnected', (reason) => {
   console.log('⚠️ Disconnected:', reason);
+  process.exit(1);
 });
+
+// Watchdog: whatsapp-web.js can silently lose its connection without ever
+// firing the 'disconnected' event. Every 3 minutes, actively ask the client
+// for its real state; if it's not CONNECTED, restart the process — Railway's
+// restart policy will spin up a fresh container automatically.
+setInterval(async () => {
+  try {
+    const state = await Promise.race([
+      client.getState(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('getState timed out')), 20000)),
+    ]);
+    console.log('🩺 Watchdog check — client state:', state);
+    if (state !== 'CONNECTED') {
+      console.log('⚠️ Watchdog: state is not CONNECTED, restarting process...');
+      process.exit(1);
+    }
+  } catch (err) {
+    console.log('⚠️ Watchdog: health check failed (' + err.message + '), restarting process...');
+    process.exit(1);
+  }
+}, 3 * 60 * 1000);
+
+// Every 5 minutes, check any !signal predictions that have "matured" (their
+// forward window has passed) and score them against the real market price.
+setInterval(async () => {
+  const now = Date.now();
+  const due = predictionLog.filter(p => !p.evaluated && now - p.createdAt >= p.forwardMinutes * 60 * 1000);
+  if (due.length === 0) return;
+
+  const symbols = [...new Set(due.map(p => p.symbol))];
+  const prices = {};
+  for (const sym of symbols) {
+    try {
+      const q = await fetchQuote(sym);
+      prices[sym] = parseFloat(q.close);
+    } catch (e) {
+      console.log('⚠️ Accuracy check: could not fetch price for', sym, e.message);
+    }
+  }
+
+  for (const p of due) {
+    if (prices[p.symbol] === undefined) continue;
+    p.evaluated = true;
+    p.exitPrice = prices[p.symbol];
+    p.correct = p.direction === 'UP' ? prices[p.symbol] > p.entryPrice : prices[p.symbol] < p.entryPrice;
+  }
+}, 5 * 60 * 1000);
+
+// Every 2 minutes, check watched price levels. If price is close to a
+// watched level and we haven't alerted on it recently, send a proactive
+// WhatsApp message with the real historical bounce/break stat for that level.
+const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // don't spam the same level more than once per 30 min
+const TOLERANCE_PCT = 0.08;
+
+setInterval(async () => {
+  if (watchList.length === 0 || !notifyChatId) return;
+
+  const symbols = [...new Set(watchList.map(w => w.symbol))];
+  const prices = {};
+  for (const sym of symbols) {
+    try {
+      const q = await fetchQuote(sym);
+      prices[sym] = parseFloat(q.close);
+    } catch (e) {
+      console.log('⚠️ Watchlist: could not fetch price for', sym, e.message);
+    }
+  }
+
+  const now = Date.now();
+  for (const w of watchList) {
+    const price = prices[w.symbol];
+    if (price === undefined) continue;
+    const distPct = (Math.abs(price - w.level) / w.level) * 100;
+    if (distPct > TOLERANCE_PCT) continue;
+    if (w.lastAlertAt && now - w.lastAlertAt < ALERT_COOLDOWN_MS) continue;
+
+    w.lastAlertAt = now;
+    const statLine = w.stats
+      ? `Historically, after touching this zone, price went UP ${w.stats.upPct}% / DOWN ${w.stats.downPct}% (n=${w.stats.sampleSize}, ${w.stats.confidence}).`
+      : `Not enough historical data on this exact level to give a reliable stat.`;
+
+    try {
+      await client.sendMessage(
+        notifyChatId,
+        `🔔 *Price Alert: ${w.symbol}*\n\n` +
+        `Price ${price} is near your watched ${w.type} level (${w.level}).\n\n` +
+        `📊 ${statLine}\n\n` +
+        `⚠️ Ye history ka statistic hai, guarantee nahi. Apna paisa soch samajh kar lagayein.`
+      );
+    } catch (e) {
+      console.log('⚠️ Could not send watch alert:', e.message);
+    }
+  }
+}, 2 * 60 * 1000);
 
 client.on('message', async (msg) => {
   let from = msg.from.replace('@c.us', '').replace('@lid', '');
   const rawLid = msg.from.endsWith('@lid') ? msg.from.replace('@lid', '') : null;
 
-  // Ignore WhatsApp status broadcasts
   if (msg.from === 'status@broadcast') return;
 
   console.log('📩 Message received from:', from, '(raw:', msg.from, ') | ALLOWED_NUMBER is:', ALLOWED_NUMBER, '| text:', msg.body);
 
-  // Optional: restrict to your own number/LID only
   const isAllowed = !ALLOWED_NUMBER || from === ALLOWED_NUMBER || rawLid === ALLOWED_NUMBER;
   if (!isAllowed) {
     console.log('   -> Ignored (number/LID does not match ALLOWED_NUMBER)');
@@ -85,6 +189,9 @@ client.on('message', async (msg) => {
   }
 
   const text = msg.body.trim();
+
+  // Capture the chat to use for proactive watch alerts.
+  notifyChatId = msg.from;
 
   if (text.toLowerCase() === '!help' || text.toLowerCase() === 'help') {
     await msg.reply(
@@ -94,18 +201,116 @@ client.on('message', async (msg) => {
       '!analyze EURUSD - detailed multi-timeframe analysis (hours/days ke liye)\n' +
       '!full EURUSD - poori history, har timeframe pe pattern analysis\n' +
       '!signal EURUSD - quick UP/DOWN guess (5-min, short expiry ke liye)\n' +
-      '!predict EURUSD - 1 se 60 minute tak har duration ka history-based stat\n\n' +
+      '!predict EURUSD - 1 se 60 minute tak har duration ka history-based stat\n' +
+      '!accuracy - bot ke pichle !signal calls kitne sahi nikle (since last restart)\n' +
+      '!watch EURUSD - key support/resistance level watch karo, auto-alert milega\n' +
+      '!watchlist - abhi kya watch ho raha hai dekho\n' +
+      '!unwatch EURUSD - watch hatao\n' +
+      '!backtest EURUSD - method ka real out-of-sample historical accuracy dekho\n\n' +
       'Supported shortcuts: EURUSD, GBPUSD, USDJPY, USDPKR, USDINR, AUDUSD, USDCAD, USDCHF, NZDUSD, EURGBP, XAUUSD'
     );
     return;
   }
 
+  const backtestMatch = text.match(/^!backtest\s+(\S+)/i);
+  if (backtestMatch) {
+    const pair = backtestMatch[1];
+    try {
+      await msg.reply('⏳ Backtest chal raha hai ' + pair.toUpperCase() + '... (thoda time lagega)');
+      const result = await backtestMethod(pair);
+      await msg.reply(result);
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
+    }
+    return;
+  }
+
+  if (text.toLowerCase() === '!watchlist') {
+    if (watchList.length === 0) {
+      await msg.reply('Abhi koi pair watch nahi ho raha. !watch EURUSD jaisa command bhejo.');
+      return;
+    }
+    const lines = watchList.map(w => `${w.symbol} — ${w.type} @ ${w.level}${w.stats ? ` (UP ${w.stats.upPct}%/DOWN ${w.stats.downPct}%, n=${w.stats.sampleSize})` : ' (not enough history)'}`);
+    await msg.reply('*Currently watching:*\n' + lines.join('\n'));
+    return;
+  }
+
+  const unwatchMatch = text.match(/^!unwatch\s+(\S+)/i);
+  if (unwatchMatch) {
+    const { normalizePair } = require('./analysis');
+    const symbol = normalizePair(unwatchMatch[1]);
+    const before = watchList.length;
+    for (let i = watchList.length - 1; i >= 0; i--) {
+      if (watchList[i].symbol === symbol) watchList.splice(i, 1);
+    }
+    await msg.reply(before > watchList.length ? `${symbol} ka watch hata diya.` : `${symbol} watch mein nahi tha.`);
+    return;
+  }
+
+  const watchMatch = text.match(/^!watch\s+(\S+)/i);
+  if (watchMatch) {
+    const pair = watchMatch[1];
+    try {
+      await msg.reply('⏳ Key levels detect ho rahe hain ' + pair.toUpperCase() + '...');
+      const info = await getKeyLevelsWithStats(pair);
+
+      // remove any existing watch for this symbol before adding fresh ones
+      for (let i = watchList.length - 1; i >= 0; i--) {
+        if (watchList[i].symbol === info.symbol) watchList.splice(i, 1);
+      }
+      watchList.push({ symbol: info.symbol, level: info.resistance, type: 'resistance', stats: info.resistanceStats, lastAlertAt: null });
+      watchList.push({ symbol: info.symbol, level: info.support, type: 'support', stats: info.supportStats, lastAlertAt: null });
+
+      const resLine = info.resistanceStats
+        ? `UP ${info.resistanceStats.upPct}% / DOWN ${info.resistanceStats.downPct}% (n=${info.resistanceStats.sampleSize}, ${info.resistanceStats.confidence})`
+        : 'not enough historical touches yet';
+      const supLine = info.supportStats
+        ? `UP ${info.supportStats.upPct}% / DOWN ${info.supportStats.downPct}% (n=${info.supportStats.sampleSize}, ${info.supportStats.confidence})`
+        : 'not enough historical touches yet';
+
+      await msg.reply(
+        `*${info.symbol} — Now Watching*\n\n` +
+        `Price: ${info.price}\n\n` +
+        `Resistance: ${info.resistance}\n  History: ${resLine}\n\n` +
+        `Support: ${info.support}\n  History: ${supLine}\n\n` +
+        `Jab bhi price in levels ke paas (±${TOLERANCE_PCT}%) aayega, bot khud message bhejega (max har 30 min mein ek baar per level).\n\n` +
+        `⚠️ Ye history ka statistic hai, guarantee nahi.`
+      );
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
+    }
+    return;
+  }
+
   if (text.toLowerCase() === '!status') {
     const uptimeMin = Math.floor((Date.now() - startTime) / 60000);
+    const marketNote = isForexMarketLikelyClosed() ? '\n⚠️ Forex market abhi likely CLOSED hai (weekend).' : '';
     await msg.reply(
       '✅ Bot online hai aur WhatsApp se connected hai.\n' +
-      `Uptime: ${uptimeMin} minute\n\n` +
+      `Uptime: ${uptimeMin} minute` + marketNote + '\n\n' +
       'Commands ke liye !help bhejo.'
+    );
+    return;
+  }
+
+  if (text.toLowerCase() === '!accuracy') {
+    const evaluated = predictionLog.filter(p => p.evaluated);
+    const pending = predictionLog.filter(p => !p.evaluated);
+    if (evaluated.length === 0) {
+      await msg.reply(
+        `Abhi tak koi !signal prediction matured nahi hui (evaluate hone mein 15 minute lagte hain).\n` +
+        `Pending: ${pending.length}\n\n` +
+        `Note: Ye track record sirf is bot session ke liye hai — restart hone par reset ho jata hai.`
+      );
+      return;
+    }
+    const correct = evaluated.filter(p => p.correct).length;
+    const pct = Math.round((correct / evaluated.length) * 100);
+    await msg.reply(
+      `*Bot's Track Record (this session)*\n\n` +
+      `${correct}/${evaluated.length} correct (${pct}%)\n` +
+      `Pending evaluation: ${pending.length}\n\n` +
+      `Note: Ye sirf is bot session ka data hai (restart hone par reset ho jata hai — permanent storage abhi set up nahi hai). Chhota sample abhi ho sakta hai, isliye is number ko bhi ehtiyaat se lena.`
     );
     return;
   }
@@ -142,7 +347,31 @@ client.on('message', async (msg) => {
     try {
       await msg.reply('⏳ Quick signal fetch ho raha hai ' + pair.toUpperCase() + '...');
       const result = await quickSignal(pair);
-      await msg.reply(result);
+      let fullMessage = result.message;
+
+      try {
+        const crossInfo = await crossPairConfirmation(result.meta.symbol);
+        if (crossInfo && crossInfo.length) {
+          const crossLines = crossInfo.map(c => `${c.pair}: ${c.changePct > 0 ? '+' : ''}${c.changePct}% today`);
+          fullMessage += `\n\n🔗 *Related pairs (context):*\n${crossLines.join('\n')}`;
+        }
+      } catch (e) {
+        // cross-pair check is best-effort; ignore failures silently
+      }
+
+      await msg.reply(fullMessage);
+      if (result.meta.direction !== 'UNCLEAR') {
+        predictionLog.push({
+          symbol: result.meta.symbol,
+          entryPrice: result.meta.price,
+          direction: result.meta.direction,
+          forwardMinutes: result.meta.forwardMinutes,
+          createdAt: Date.now(),
+          evaluated: false,
+        });
+        // keep the log from growing unbounded
+        if (predictionLog.length > 500) predictionLog.splice(0, predictionLog.length - 500);
+      }
     } catch (err) {
       await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
     }

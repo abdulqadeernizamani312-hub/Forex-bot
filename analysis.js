@@ -4,17 +4,9 @@ const BASE_URL = 'https://api.twelvedata.com';
 const API_KEY = process.env.TWELVE_DATA_API_KEY;
 
 const PAIR_ALIASES = {
-  eurusd: 'EUR/USD',
-  gbpusd: 'GBP/USD',
-  usdjpy: 'USD/JPY',
-  usdpkr: 'USD/PKR',
-  usdinr: 'USD/INR',
-  audusd: 'AUD/USD',
-  usdcad: 'USD/CAD',
-  usdchf: 'USD/CHF',
-  nzdusd: 'NZD/USD',
-  eurgbp: 'EUR/GBP',
-  xauusd: 'XAU/USD',
+  eurusd: 'EUR/USD', gbpusd: 'GBP/USD', usdjpy: 'USD/JPY', usdpkr: 'USD/PKR',
+  usdinr: 'USD/INR', audusd: 'AUD/USD', usdcad: 'USD/CAD', usdchf: 'USD/CHF',
+  nzdusd: 'NZD/USD', eurgbp: 'EUR/GBP', xauusd: 'XAU/USD',
 };
 
 function normalizePair(input) {
@@ -26,10 +18,53 @@ function normalizePair(input) {
   return input.toUpperCase();
 }
 
+function isForexMarketLikelyClosed(date = new Date()) {
+  const day = date.getUTCDay();
+  const hour = date.getUTCHours();
+  if (day === 6) return true;
+  if (day === 0 && hour < 21) return true;
+  if (day === 5 && hour >= 21) return true;
+  return false;
+}
+
+// Rough major-session windows (UTC). Not exact, but good enough to flag
+// which markets are actively driving liquidity right now.
+function getSessionInfo(date = new Date()) {
+  const hour = date.getUTCHours();
+  const sydney = hour >= 21 || hour < 6;
+  const tokyo = hour >= 0 && hour < 9;
+  const london = hour >= 7 && hour < 16;
+  const newyork = hour >= 12 && hour < 21;
+  const active = [];
+  if (sydney) active.push('Sydney');
+  if (tokyo) active.push('Tokyo');
+  if (london) active.push('London');
+  if (newyork) active.push('New York');
+  return { sydney, tokyo, london, newyork, active };
+}
+
+// Very rough, hardcoded heuristic for predictable high-impact news timing —
+// NOT a live calendar (no reliable free calendar API without a paid key was
+// found). This only catches the most predictable recurring events.
+function newsRiskWarning(date = new Date()) {
+  const day = date.getUTCDay();
+  const hour = date.getUTCHours();
+  const dayOfMonth = date.getUTCDate();
+  const warnings = [];
+
+  // US NFP: first Friday of the month, ~12:30 UTC
+  if (day === 5 && dayOfMonth <= 7 && hour >= 12 && hour < 14) {
+    warnings.push('Aaj US Non-Farm Payrolls (NFP) ka din ho sakta hai (~12:30 UTC) — high volatility expected.');
+  }
+  // Generic: most central bank decisions & major US data land 12:30-15:00 UTC on weekdays
+  if (day >= 1 && day <= 5 && hour >= 12 && hour < 15) {
+    warnings.push('Ye time window (12:30-15:00 UTC) mein aksar major US economic data / Fed announcements aate hain — thoda extra ehtiyaat.');
+  }
+  return warnings;
+}
+
 async function apiGet(path, params) {
-  const { data } = await axios.get(`${BASE_URL}/${path}`, {
-    params: { ...params, apikey: API_KEY },
-  });
+  const { data } = await axios.get(`${BASE_URL}/${path}`, { params: { ...params, apikey: API_KEY } });
   if (data.code && data.code !== 200) throw new Error(data.message || `Failed: ${path}`);
   return data;
 }
@@ -38,98 +73,66 @@ async function fetchQuote(symbol) {
   return apiGet('quote', { symbol });
 }
 
-// candles come back newest-first from Twelve Data
 async function fetchCandles(symbol, interval, outputsize = 60) {
   const data = await apiGet('time_series', { symbol, interval, outputsize });
   return data.values.map(v => ({
     time: v.datetime,
-    open: parseFloat(v.open),
-    high: parseFloat(v.high),
-    low: parseFloat(v.low),
-    close: parseFloat(v.close),
+    open: parseFloat(v.open), high: parseFloat(v.high),
+    low: parseFloat(v.low), close: parseFloat(v.close),
   }));
 }
 
-// ---- Locally-computed indicators (no extra API calls) ----
-
-// Simple Moving Average over the most recent `period` closes.
-// candles[0] is the newest candle.
+// ---- Basic indicators ----
 function sma(candles, period) {
   const closes = candles.slice(0, period).map(c => c.close);
   return closes.reduce((a, b) => a + b, 0) / closes.length;
 }
 
-// Standard RSI (Wilder's smoothing), computed oldest -> newest.
 function rsi(candles, period = 14) {
-  const chron = [...candles].reverse(); // oldest first
-  if (chron.length < period + 1) return 50; // not enough data, neutral fallback
-
-  let gains = 0;
-  let losses = 0;
+  const chron = [...candles].reverse();
+  if (chron.length < period + 1) return 50;
+  let gains = 0, losses = 0;
   for (let i = 1; i <= period; i++) {
     const diff = chron[i].close - chron[i - 1].close;
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
+    if (diff >= 0) gains += diff; else losses -= diff;
   }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-
+  let avgGain = gains / period, avgLoss = losses / period;
   for (let i = period + 1; i < chron.length; i++) {
     const diff = chron[i].close - chron[i - 1].close;
-    const gain = diff > 0 ? diff : 0;
-    const loss = diff < 0 ? -diff : 0;
+    const gain = diff > 0 ? diff : 0, loss = diff < 0 ? -diff : 0;
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
   }
-
   if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+  return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
-// Average True Range (simple average, period candles).
 function atr(candles, period = 14) {
-  const chron = [...candles].reverse(); // oldest first
+  const chron = [...candles].reverse();
   if (chron.length < period + 1) return 0;
-
   const trueRanges = [];
   for (let i = 1; i < chron.length; i++) {
-    const cur = chron[i];
-    const prev = chron[i - 1];
-    const tr = Math.max(
-      cur.high - cur.low,
-      Math.abs(cur.high - prev.close),
-      Math.abs(cur.low - prev.close)
-    );
-    trueRanges.push(tr);
+    const cur = chron[i], prev = chron[i - 1];
+    trueRanges.push(Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
   }
   const recent = trueRanges.slice(-period);
   return recent.reduce((a, b) => a + b, 0) / recent.length;
 }
 
-// ---- Rolling series versions (value at every point in history, not just latest) ----
-// These let us look back through history and ask "what was RSI/trend at each
-// past candle" so we can find similar past setups.
-
+// ---- Rolling series ----
 function rsiSeries(closesChron, period = 14) {
   const out = new Array(closesChron.length).fill(null);
   if (closesChron.length < period + 1) return out;
-
-  let gains = 0;
-  let losses = 0;
+  let gains = 0, losses = 0;
   for (let i = 1; i <= period; i++) {
     const diff = closesChron[i] - closesChron[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
+    if (diff >= 0) gains += diff; else losses -= diff;
   }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
+  let avgGain = gains / period, avgLoss = losses / period;
   out[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-
   for (let i = period + 1; i < closesChron.length; i++) {
     const diff = closesChron[i] - closesChron[i - 1];
-    const gain = diff > 0 ? diff : 0;
-    const loss = diff < 0 ? -diff : 0;
+    const gain = diff > 0 ? diff : 0, loss = diff < 0 ? -diff : 0;
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
     out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
@@ -147,121 +150,252 @@ function smaSeries(closesChron, period) {
   return out;
 }
 
-// Looks through history for past moments where RSI + short/long-average
-// momentum matched the current setup, and reports how often price ended up
-// higher vs lower a few candles later. This is an actual data-backed
-// statistic (from this pair's real price history), not a guess.
-function historicalPatternStats(candlesNewestFirst, { period = 14, fastP = 5, slowP = 20, forwardSteps = 3, rsiBucketSize = 10 } = {}) {
-  const chron = [...candlesNewestFirst].reverse().map(c => c.close); // oldest -> newest
+function atrPctSeries(candlesChron, period = 14) {
+  const n = candlesChron.length;
+  const out = new Array(n).fill(null);
+  const trueRanges = new Array(n).fill(null);
+  for (let i = 1; i < n; i++) {
+    const cur = candlesChron[i], prev = candlesChron[i - 1];
+    trueRanges[i] = Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close));
+  }
+  for (let i = period; i < n; i++) {
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += trueRanges[j];
+    out[i] = ((sum / period) / candlesChron[i].close) * 100;
+  }
+  return out;
+}
+
+function marginOfError(pct, sampleSize) {
+  const p = pct / 100;
+  return Math.round(1.96 * Math.sqrt((p * (1 - p)) / sampleSize) * 100);
+}
+
+function confidenceLabel(margin) {
+  if (margin <= 6) return 'High confidence (large sample)';
+  if (margin <= 12) return 'Medium confidence';
+  return 'Low confidence (small sample)';
+}
+
+// ---- Candlestick pattern detection (simple heuristics) ----
+// Returns 'bullish', 'bearish', or null for the candle at chronIndex i
+// (needs candlesChron[i] and candlesChron[i-1]).
+function candlePatternAt(candlesChron, i) {
+  if (i < 1) return null;
+  const cur = candlesChron[i], prev = candlesChron[i - 1];
+  const body = Math.abs(cur.close - cur.open);
+  const range = cur.high - cur.low || 1e-9;
+  const upperWick = cur.high - Math.max(cur.close, cur.open);
+  const lowerWick = Math.min(cur.close, cur.open) - cur.low;
+  const prevBody = Math.abs(prev.close - prev.open);
+
+  // Engulfing
+  const curBull = cur.close > cur.open;
+  const prevBull = prev.close > prev.open;
+  if (curBull && !prevBull && cur.close >= prev.open && cur.open <= prev.close && body > prevBody) return 'bullish';
+  if (!curBull && prevBull && cur.open >= prev.close && cur.close <= prev.open && body > prevBody) return 'bearish';
+
+  // Hammer (small body, long lower wick, near top of range) — bullish
+  if (body / range < 0.35 && lowerWick > body * 2 && upperWick < body) return 'bullish';
+  // Shooting star (small body, long upper wick, near bottom) — bearish
+  if (body / range < 0.35 && upperWick > body * 2 && lowerWick < body) return 'bearish';
+
+  return null;
+}
+
+// Generic backtest helper: given a boolean/null "predicts up?" array aligned
+// to chron closes, measure how often that prediction matched what actually
+// happened `forwardSteps` candles later. Used to auto-weight each factor by
+// its own real historical accuracy instead of a fixed guess.
+function factorAccuracy(chronCloses, predictArr, forwardSteps) {
+  let correct = 0, total = 0;
+  const n = chronCloses.length;
+  for (let i = 0; i < n - forwardSteps; i++) {
+    if (predictArr[i] === null || predictArr[i] === undefined) continue;
+    const actualUp = chronCloses[i + forwardSteps] > chronCloses[i];
+    if (predictArr[i] === actualUp) correct++;
+    total++;
+  }
+  if (total < 20) return { accuracy: 0.5, total };
+  return { accuracy: correct / total, total };
+}
+
+// Builds an auto-weighted ensemble signal: several simple factors are each
+// backtested against this pair's own history to find their real standalone
+// accuracy, then combined weighted by (accuracy - 0.5) — factors that
+// historically did no better than a coin flip contribute ~nothing.
+function ensembleSignal(candlesNewestFirst, { forwardSteps = 3, period = 14, fastP = 5, slowP = 20, longP = 200 } = {}) {
+  const chronCandles = [...candlesNewestFirst].reverse();
+  const chron = chronCandles.map(c => c.close);
   const n = chron.length;
+
   const rsiArr = rsiSeries(chron, period);
   const fastArr = smaSeries(chron, fastP);
   const slowArr = smaSeries(chron, slowP);
+  const longArr = n >= longP ? smaSeries(chron, longP) : null;
 
-  const currentIdx = n - 1;
-  const currentRSI = rsiArr[currentIdx];
-  const currentFast = fastArr[currentIdx];
-  const currentSlow = slowArr[currentIdx];
-  if (currentRSI === null || currentFast === null || currentSlow === null) return null;
+  // Factor 1: fast/slow SMA cross
+  const f1 = chron.map((_, i) => (fastArr[i] !== null && slowArr[i] !== null) ? fastArr[i] > slowArr[i] : null);
+  // Factor 2: last-3-candle momentum
+  const f2 = chron.map((_, i) => (i >= 2) ? chron[i] > chron[i - 2] : null);
+  // Factor 3: RSI extreme (only signals at extremes, else null)
+  const f3 = chron.map((_, i) => {
+    if (rsiArr[i] === null) return null;
+    if (rsiArr[i] >= 60) return true;
+    if (rsiArr[i] <= 40) return false;
+    return null;
+  });
+  // Factor 4: medium/long-term SMA cross
+  const f4 = longArr ? chron.map((_, i) => (fastArr[i] !== null && longArr[i] !== null) ? fastArr[i] > longArr[i] : null) : null;
+  // Factor 5: candlestick pattern
+  const f5 = chronCandles.map((_, i) => {
+    const p = candlePatternAt(chronCandles, i);
+    if (p === 'bullish') return true;
+    if (p === 'bearish') return false;
+    return null;
+  });
 
-  const currentBucket = Math.floor(currentRSI / rsiBucketSize);
-  const currentTrendUp = currentFast > currentSlow;
+  const factors = [
+    { name: 'Short/long average cross', arr: f1 },
+    { name: 'Recent candle momentum', arr: f2 },
+    { name: 'RSI extreme', arr: f3 },
+    { name: 'Candlestick pattern', arr: f5 },
+  ];
+  if (f4) factors.push({ name: 'Medium-term trend', arr: f4 });
 
-  let up = 0;
-  let down = 0;
-  const startIdx = Math.max(period, fastP, slowP);
-  const endIdx = n - 1 - forwardSteps; // need forward data to check outcome
+  let weightedUp = 0;
+  let weightedDown = 0;
+  let totalWeight = 0;
+  const reasons = [];
 
-  for (let i = startIdx; i < endIdx; i++) {
-    if (rsiArr[i] === null || fastArr[i] === null || slowArr[i] === null) continue;
-    const bucket = Math.floor(rsiArr[i] / rsiBucketSize);
-    const trendUp = fastArr[i] > slowArr[i];
-    if (bucket === currentBucket && trendUp === currentTrendUp) {
-      if (chron[i + forwardSteps] > chron[i]) up++;
-      else down++;
-    }
+  for (const f of factors) {
+    const currentVal = f.arr[n - 1];
+    if (currentVal === null || currentVal === undefined) continue;
+    const { accuracy, total } = factorAccuracy(chron, f.arr, forwardSteps);
+    const weight = Math.max(0, accuracy - 0.5);
+    if (weight <= 0.005) continue; // factor has no real historical edge for this pair, ignore it
+    totalWeight += weight;
+    if (currentVal) { weightedUp += weight; reasons.push(`${f.name}: says UP (this factor's own historical accuracy: ${Math.round(accuracy * 100)}%, n=${total})`); }
+    else { weightedDown += weight; reasons.push(`${f.name}: says DOWN (this factor's own historical accuracy: ${Math.round(accuracy * 100)}%, n=${total})`); }
   }
 
-  const total = up + down;
-  if (total < 8) return null; // not enough similar historical setups to trust
+  const direction = weightedUp > weightedDown ? 'UP' : weightedDown > weightedUp ? 'DOWN' : 'UNCLEAR';
+  const strength = totalWeight > 0 ? Math.round((Math.max(weightedUp, weightedDown) / totalWeight) * 100) : 50;
 
+  return { direction, strength, reasons, factorsUsed: reasons.length };
+}
+
+// Proper out-of-sample backtest: split history into train/test, build a
+// lookup of (RSI-bucket, trend) -> outcome using ONLY the training portion,
+// then test predictions on the later (test) portion the method never saw.
+function backtestSetup(candlesNewestFirst, { forwardSteps = 3, rsiBucketSize = 10, trainFraction = 0.7 } = {}) {
+  const chronCandles = [...candlesNewestFirst].reverse();
+  const chron = chronCandles.map(c => c.close);
+  const n = chron.length;
+  const rsiArr = rsiSeries(chron, 14);
+  const fastArr = smaSeries(chron, 5);
+  const slowArr = smaSeries(chron, 20);
+
+  const splitIdx = Math.floor(n * trainFraction);
+  const lookup = {}; // key -> {up, down}
+
+  for (let j = 20; j < splitIdx - forwardSteps; j++) {
+    if (rsiArr[j] === null || fastArr[j] === null || slowArr[j] === null) continue;
+    const bucket = Math.floor(rsiArr[j] / rsiBucketSize);
+    const trendUp = fastArr[j] > slowArr[j];
+    const key = `${bucket}_${trendUp}`;
+    if (!lookup[key]) lookup[key] = { up: 0, down: 0 };
+    if (chron[j + forwardSteps] > chron[j]) lookup[key].up++;
+    else lookup[key].down++;
+  }
+
+  let correct = 0, wrong = 0, skipped = 0;
+  let baselineUp = 0, baselineDown = 0;
+
+  for (let i = splitIdx; i < n - forwardSteps; i++) {
+    if (rsiArr[i] === null || fastArr[i] === null || slowArr[i] === null) continue;
+    const actualUp = chron[i + forwardSteps] > chron[i];
+    if (actualUp) baselineUp++; else baselineDown++;
+
+    const bucket = Math.floor(rsiArr[i] / rsiBucketSize);
+    const trendUp = fastArr[i] > slowArr[i];
+    const key = `${bucket}_${trendUp}`;
+    const stat = lookup[key];
+    if (!stat || stat.up + stat.down < 8) { skipped++; continue; }
+
+    const predictedUp = stat.up > stat.down;
+    if (predictedUp === actualUp) correct++; else wrong++;
+  }
+
+  const totalPredicted = correct + wrong;
+  const baselineTotal = baselineUp + baselineDown;
   return {
-    upPct: Math.round((up / total) * 100),
-    downPct: Math.round((down / total) * 100),
-    sampleSize: total,
-    forwardSteps,
+    totalTestPoints: n - splitIdx - forwardSteps,
+    predicted: totalPredicted,
+    skipped,
+    correct,
+    wrong,
+    accuracyPct: totalPredicted > 0 ? Math.round((correct / totalPredicted) * 100) : null,
+    baselinePct: baselineTotal > 0 ? Math.round((Math.max(baselineUp, baselineDown) / baselineTotal) * 100) : null,
   };
 }
 
-// Full-history version: pulls the maximum available history for EVERY
-// timeframe (1h, 4h, 1day) and runs the historical pattern-match on each —
-// not just current trend/RSI, but "in this pair's whole available history,
-// what usually happened next from a setup like this, on this timeframe."
-async function fullHistoryAnalysis(rawInput) {
+async function backtestMethod(rawInput) {
   const symbol = normalizePair(rawInput);
-
-  // Still only 3 API calls total (1 per timeframe) — Twelve Data charges per
-  // call, not per outputsize, so we ask for the max history each time.
-  const [candles1h, candles4h, candles1d] = await Promise.all([
-    fetchCandles(symbol, '1h', 5000),
-    fetchCandles(symbol, '4h', 5000),
-    fetchCandles(symbol, '1day', 5000),
-  ]);
-
-  const price = candles1h[0].close;
-
-  const timeframes = [
-    { label: '1 Hour', candles: candles1h, forwardSteps: 4, forwardLabel: '~4 hours' },
-    { label: '4 Hour', candles: candles4h, forwardSteps: 3, forwardLabel: '~12 hours' },
-    { label: 'Daily', candles: candles1d, forwardSteps: 3, forwardLabel: '~3 days' },
-  ];
+  const candles = await fetchCandles(symbol, '5min', 3000); // 1 API call
+  const result = backtestSetup(candles, { forwardSteps: 3 });
 
   const lines = [
-    `*${symbol} — Full History Analysis*`,
+    `*${symbol} — Backtest (out-of-sample, 5min/15min-ahead)*`,
     ``,
-    `Price: ${price}`,
+    `Test period: last ~30% of available history (method trained only on the earlier ~70%, never saw this part).`,
     ``,
-    `Har timeframe ki poori available history se pattern nikala gaya hai — jab bhi is pair mein abhi jaisa RSI+momentum setup pehle bana tha, uske baad price kis taraf gaya.`,
+    `Predictions made: ${result.predicted} (skipped ${result.skipped} — not enough training data for that setup)`,
+    result.accuracyPct !== null ? `*Method accuracy: ${result.accuracyPct}%*` : 'Not enough data to score.',
+    result.baselinePct !== null ? `Naive baseline (always guess the more common direction): ${result.baselinePct}%` : '',
     ``,
-  ];
-
-  let bullScore = 0;
-  let bearScore = 0;
-  const summaryReasons = [];
-
-  for (const tf of timeframes) {
-    const rsiVal = rsi(tf.candles, 14);
-    const trend = trendFromCandles(tf.candles);
-    const pattern = historicalPatternStats(tf.candles, { forwardSteps: tf.forwardSteps });
-
-    lines.push(`*${tf.label} timeframe:*`);
-    lines.push(`  Trend: ${trend} | RSI: ${rsiVal.toFixed(1)} — ${interpretRSI(rsiVal)}`);
-    if (pattern) {
-      lines.push(`  History: ${pattern.sampleSize} similar past setups → UP ${pattern.upPct}% / DOWN ${pattern.downPct}% over next ${tf.forwardLabel}`);
-      if (pattern.upPct > pattern.downPct) { bullScore++; summaryReasons.push(`${tf.label}: history leans UP (${pattern.upPct}%)`); }
-      else if (pattern.downPct > pattern.upPct) { bearScore++; summaryReasons.push(`${tf.label}: history leans DOWN (${pattern.downPct}%)`); }
-    } else {
-      lines.push(`  History: not enough similar past setups found on this timeframe yet`);
-    }
-    lines.push(``);
-  }
-
-  let overall;
-  if (bullScore > bearScore) overall = `Overall lean: BUY (${bullScore}/${bullScore + bearScore} timeframes agree)`;
-  else if (bearScore > bullScore) overall = `Overall lean: SELL (${bearScore}/${bullScore + bearScore} timeframes agree)`;
-  else overall = `Overall lean: NO CLEAR AGREEMENT across timeframes`;
-
-  lines.push(`*${overall}*`);
-  if (summaryReasons.length) {
-    lines.push(...summaryReasons.map(r => `• ${r}`));
-  }
-
-  lines.push(
+    result.accuracyPct !== null && result.baselinePct !== null
+      ? (result.accuracyPct > result.baselinePct
+          ? `✅ Method beat the naive baseline by ${result.accuracyPct - result.baselinePct} points — some real (if modest) historical edge on this pair.`
+          : `⚠️ Method did NOT beat the naive baseline — no real edge found on this pair/timeframe right now.`)
+      : '',
     ``,
-    `⚠️ *Zaroori warning:* Ye poori history ka statistic hai, lekin history repeat hone ki guarantee kabhi nahi hoti. Bade timeframes (4H, Daily) ka lean thoda zyada meaningful hota hai chhote (1H) se, lekin risk hamesha rehta hai. Stop-loss zaroor use karein.`
-  );
+    `⚠️ Ye ek single train/test split hai (poori proper cross-validation nahi), aur past performance future ki guarantee kabhi nahi hoti — market conditions badalte rehte hain.`,
+  ].filter(Boolean);
 
   return lines.join('\n');
+}
+
+function bounceStats(candlesNewestFirst, level, { tolerancePct = 0.08, forwardSteps = 6, minGap = 5 } = {}) {
+  const chron = [...candlesNewestFirst].reverse();
+  const n = chron.length;
+  let lastTouchIdx = -Infinity, up = 0, down = 0;
+  for (let i = 1; i < n - forwardSteps; i++) {
+    if (i - lastTouchIdx < minGap) continue;
+    const price = chron[i].close;
+    const distPct = (Math.abs(price - level) / level) * 100;
+    if (distPct <= tolerancePct) {
+      lastTouchIdx = i;
+      if (chron[i + forwardSteps].close > price) up++; else down++;
+    }
+  }
+  const total = up + down;
+  if (total < 5) return null;
+  const upPct = Math.round((up / total) * 100), downPct = Math.round((down / total) * 100);
+  return { upPct, downPct, sampleSize: total, margin: marginOfError(upPct, total), confidence: confidenceLabel(marginOfError(upPct, total)) };
+}
+
+async function getKeyLevelsWithStats(rawInput) {
+  const symbol = normalizePair(rawInput);
+  const candles = await fetchCandles(symbol, '1h', 2000);
+  const price = candles[0].close;
+  const recent = candles.slice(0, 100);
+  const { support, resistance } = findSupportResistance(recent);
+  return {
+    symbol, price, resistance, support,
+    resistanceStats: bounceStats(candles, resistance),
+    supportStats: bounceStats(candles, support),
+  };
 }
 
 function trendFromCandles(candles) {
@@ -271,20 +405,15 @@ function trendFromCandles(candles) {
 }
 
 function findSupportResistance(candles) {
-  const highs = candles.map(c => c.high);
-  const lows = candles.map(c => c.low);
-  const resistance = Math.max(...highs);
-  const support = Math.min(...lows);
-  return { support, resistance };
+  const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
+  return { support: Math.min(...lows), resistance: Math.max(...highs) };
 }
 
 function detectStructure(candles) {
   const recent = candles.slice(0, 10);
-  const highs = recent.map(c => c.high);
-  const lows = recent.map(c => c.low);
+  const highs = recent.map(c => c.high), lows = recent.map(c => c.low);
   const higherHighs = highs[0] > highs[highs.length - 1];
   const higherLows = lows[0] > lows[lows.length - 1];
-
   if (higherHighs && higherLows) return 'Higher highs & higher lows — bullish structure';
   if (!higherHighs && !higherLows) return 'Lower highs & lower lows — bearish structure';
   return 'Mixed / ranging structure — no clear direction';
@@ -298,246 +427,262 @@ function interpretRSI(r) {
 
 function buildBias({ trend1h, trend4h, trend1d, structure, rsi1h }) {
   const reasons = [];
-  let bullScore = 0;
-  let bearScore = 0;
-
-  if (trend1h === 'UP') { bullScore++; reasons.push('1H trend is UP'); }
-  else { bearScore++; reasons.push('1H trend is DOWN'); }
-
-  if (trend4h === 'UP') { bullScore++; reasons.push('4H trend is UP'); }
-  else { bearScore++; reasons.push('4H trend is DOWN'); }
-
-  if (trend1d === 'UP') { bullScore++; reasons.push('Daily trend is UP'); }
-  else { bearScore++; reasons.push('Daily trend is DOWN'); }
-
+  let bullScore = 0, bearScore = 0;
+  if (trend1h === 'UP') { bullScore++; reasons.push('1H trend is UP'); } else { bearScore++; reasons.push('1H trend is DOWN'); }
+  if (trend4h === 'UP') { bullScore++; reasons.push('4H trend is UP'); } else { bearScore++; reasons.push('4H trend is DOWN'); }
+  if (trend1d === 'UP') { bullScore++; reasons.push('Daily trend is UP'); } else { bearScore++; reasons.push('Daily trend is DOWN'); }
   if (structure.includes('bullish')) { bullScore++; reasons.push('Recent structure is bullish (higher highs/lows)'); }
   else if (structure.includes('bearish')) { bearScore++; reasons.push('Recent structure is bearish (lower highs/lows)'); }
   else { reasons.push('Structure is mixed/ranging — no clear edge here'); }
-
   if (rsi1h >= 70) { bearScore += 0.5; reasons.push('RSI overbought — pullback risk'); }
   else if (rsi1h <= 30) { bullScore += 0.5; reasons.push('RSI oversold — bounce possible'); }
 
   let bias, confidence;
   const total = bullScore + bearScore;
-  if (bullScore > bearScore) {
-    bias = 'BUY lean';
-    confidence = `${bullScore}/${total.toFixed(1)} signals lean up`;
-  } else if (bearScore > bullScore) {
-    bias = 'SELL lean';
-    confidence = `${bearScore}/${total.toFixed(1)} signals lean down`;
-  } else {
-    bias = 'NO CLEAR LEAN — signals are split';
-    confidence = 'mixed signals';
-  }
-
+  if (bullScore > bearScore) { bias = 'BUY lean'; confidence = `${bullScore}/${total.toFixed(1)} signals lean up`; }
+  else if (bearScore > bullScore) { bias = 'SELL lean'; confidence = `${bearScore}/${total.toFixed(1)} signals lean down`; }
+  else { bias = 'NO CLEAR LEAN — signals are split'; confidence = 'mixed signals'; }
   return { bias, confidence, reasons };
 }
 
-// For a single duration (in minutes, using 1-min candles so 1 candle = 1 min),
-// count how often price went up vs down `duration` minutes after each past
-// point that had a similar RSI + momentum setup to right now.
 function statsForDuration(chron, rsiArr, fastArr, slowArr, currentBucket, currentTrendUp, duration, rsiBucketSize, minSample) {
   const n = chron.length;
   const startIdx = Math.max(rsiArr.findIndex(v => v !== null), fastArr.findIndex(v => v !== null), slowArr.findIndex(v => v !== null));
   const endIdx = n - 1 - duration;
-
-  let up = 0;
-  let down = 0;
+  let up = 0, down = 0;
   for (let i = startIdx; i < endIdx; i++) {
     if (rsiArr[i] === null || fastArr[i] === null || slowArr[i] === null) continue;
     const bucket = Math.floor(rsiArr[i] / rsiBucketSize);
     const trendUp = fastArr[i] > slowArr[i];
     if (bucket === currentBucket && trendUp === currentTrendUp) {
-      if (chron[i + duration] > chron[i]) up++;
-      else down++;
+      if (chron[i + duration] > chron[i]) up++; else down++;
     }
   }
-
   const total = up + down;
   if (total < minSample) return null;
-  return { upPct: Math.round((up / total) * 100), downPct: Math.round((down / total) * 100), sampleSize: total };
+  const upPct = Math.round((up / total) * 100), downPct = Math.round((down / total) * 100);
+  const margin = marginOfError(upPct, total);
+  return { upPct, downPct, sampleSize: total, margin, confidence: confidenceLabel(margin) };
 }
 
-// Runs the historical pattern match across many durations (in minutes) at
-// once, reusing the same RSI/SMA series so it's cheap even for 20+ durations.
 function multiDurationStats(candlesNewestFirst, durations, { period = 14, fastP = 5, slowP = 20, rsiBucketSize = 10, minSample = 8 } = {}) {
-  const chron = [...candlesNewestFirst].reverse().map(c => c.close); // oldest -> newest
+  const chron = [...candlesNewestFirst].reverse().map(c => c.close);
   const rsiArr = rsiSeries(chron, period);
   const fastArr = smaSeries(chron, fastP);
   const slowArr = smaSeries(chron, slowP);
-
   const currentIdx = chron.length - 1;
-  const currentRSI = rsiArr[currentIdx];
-  const currentFast = fastArr[currentIdx];
-  const currentSlow = slowArr[currentIdx];
+  const currentRSI = rsiArr[currentIdx], currentFast = fastArr[currentIdx], currentSlow = slowArr[currentIdx];
   if (currentRSI === null || currentFast === null || currentSlow === null) return null;
-
   const currentBucket = Math.floor(currentRSI / rsiBucketSize);
   const currentTrendUp = currentFast > currentSlow;
-
   const results = {};
-  for (const d of durations) {
-    results[d] = statsForDuration(chron, rsiArr, fastArr, slowArr, currentBucket, currentTrendUp, d, rsiBucketSize, minSample);
-  }
+  for (const d of durations) results[d] = statsForDuration(chron, rsiArr, fastArr, slowArr, currentBucket, currentTrendUp, d, rsiBucketSize, minSample);
   return results;
 }
 
 async function predictAllDurations(rawInput) {
   const symbol = normalizePair(rawInput);
-  const durations = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 30, 40, 50, 60];
-
-  // Still 1 API call. 1-minute candles so each candle = 1 minute, letting us
-  // check every duration from 1 to 60 minutes directly. Twelve Data's max
-  // outputsize per call is used to get as much history as possible.
+  const durations = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,30,40,50,60];
   const candles = await fetchCandles(symbol, '1min', 5000);
   const price = candles[0].close;
-
   const stats = multiDurationStats(candles, durations);
 
-  const lines = [
-    `*${symbol} — Multi-Duration Prediction*`,
-    ``,
-    `Price: ${price}`,
-    ``,
-    `Har duration ke liye: is pair ki apni history mein, jab bhi abhi jaisa RSI+momentum setup tha, uske "N" minute baad price kitni baar UP gaya vs DOWN.`,
-    ``,
-  ];
+  const lines = [`*${symbol} — Multi-Duration Prediction*`, ``, `Price: ${price}`, ``];
+  if (isForexMarketLikelyClosed()) lines.push('⚠️ Forex market is likely CLOSED right now (weekend).', ``);
+  lines.push(`Har duration ke liye history-based stat. (H)=High confidence, (M)=Medium, (L)=Low.`, ``);
 
   if (!stats) {
-    lines.push('Not enough data right now to compute this — try again in a bit.');
+    lines.push('Not enough data right now — try again in a bit.');
   } else {
     for (const d of durations) {
       const s = stats[d];
-      if (!s) {
-        lines.push(`${d}min: not enough historical samples yet`);
-      } else {
-        const lean = s.upPct > s.downPct ? 'UP' : s.upPct < s.downPct ? 'DOWN' : 'FLAT';
-        lines.push(`${d}min: ${lean} — UP ${s.upPct}% / DOWN ${s.downPct}% (n=${s.sampleSize})`);
-      }
+      if (!s) { lines.push(`${d}min: not enough historical samples yet`); continue; }
+      const lean = s.upPct > s.downPct ? 'UP' : s.upPct < s.downPct ? 'DOWN' : 'FLAT';
+      const tag = s.confidence.startsWith('High') ? 'H' : s.confidence.startsWith('Medium') ? 'M' : 'L';
+      lines.push(`${d}min: ${lean} (${tag}) — UP ${s.upPct}% / DOWN ${s.downPct}% (n=${s.sampleSize}, ±${s.margin}%)`);
     }
   }
-
-  lines.push(
-    ``,
-    `⚠️ *Zaroori warning:* Ye sab sirf past data ka statistic hai — "pehle aisa hua tha", future ki guarantee nahi. Chhoti durations (1-10 min) ka sample size chota hota hai (limited history ki wajah se), isliye kam reliable hain. Bade durations (30-60 min) thoda zyada meaningful ho sakte hain lekin phir bhi risk hamesha rehta hai. Apna paisa soch samajh kar lagayein.`
-  );
-
+  lines.push(``, `⚠️ Sirf past data ka statistic hai, future ki guarantee nahi.`);
   return lines.join('\n');
+}
+
+// Checks 2 other major pairs sharing a currency with `symbol` to see if the
+// broader currency-strength picture agrees with the local signal. Costs a
+// couple of extra API calls (cheap `quote` calls).
+async function crossPairConfirmation(symbol) {
+  const [base, quote] = symbol.split('/');
+  const relatedMap = {
+    USD: ['EUR/USD', 'GBP/USD'], EUR: ['EUR/USD', 'EUR/GBP'], GBP: ['GBP/USD', 'EUR/GBP'],
+    JPY: ['USD/JPY', 'EUR/JPY'], AUD: ['AUD/USD', 'AUD/JPY'], CAD: ['USD/CAD'],
+    CHF: ['USD/CHF'], NZD: ['NZD/USD'],
+  };
+  const candidates = (relatedMap[base] || []).concat(relatedMap[quote] || []);
+  const uniquePairs = [...new Set(candidates)].filter(p => p !== symbol).slice(0, 2);
+  if (uniquePairs.length === 0) return null;
+
+  try {
+    const quotes = await Promise.all(uniquePairs.map(p => fetchQuote(p)));
+    const info = quotes.map((q, idx) => ({ pair: uniquePairs[idx], changePct: parseFloat(q.percent_change) }));
+    return info;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function quickSignal(rawInput) {
   const symbol = normalizePair(rawInput);
-
-  // Still just 1 API call — Twelve Data charges 1 credit per call regardless
-  // of outputsize, so we can pull a large chunk of history for pattern
-  // matching at no extra cost.
-  const candles = await fetchCandles(symbol, '5min', 2000);
+  const candles = await fetchCandles(symbol, '5min', 2000); // 1 call
 
   const price = candles[0].close;
-  const rsi5 = rsi(candles, 14);
-  const emaFast = sma(candles, 5);
-  const emaSlow = sma(candles, 20);
-  const lastFew = candles.slice(0, 3).map(c => c.close);
-  const momentumUp = lastFew[0] > lastFew[2];
+  const ensemble = ensembleSignal(candles, { forwardSteps: 3 });
+  const pattern = (function () {
+    const chronCandles = [...candles].reverse();
+    const chron = chronCandles.map(c => c.close);
+    const rsiArr = rsiSeries(chron, 14);
+    const fastArr = smaSeries(chron, 5);
+    const slowArr = smaSeries(chron, 20);
+    const idx = chron.length - 1;
+    if (rsiArr[idx] === null) return null;
+    // reuse bucket-based historical stat as before, for the headline number
+    const rsiBucketSize = 10;
+    const currentBucket = Math.floor(rsiArr[idx] / rsiBucketSize);
+    const currentTrendUp = fastArr[idx] > slowArr[idx];
+    let up = 0, down = 0;
+    for (let i = 20; i < chron.length - 3; i++) {
+      if (rsiArr[i] === null) continue;
+      const bucket = Math.floor(rsiArr[i] / rsiBucketSize);
+      const trendUp = fastArr[i] > slowArr[i];
+      if (bucket === currentBucket && trendUp === currentTrendUp) {
+        if (chron[i + 3] > chron[i]) up++; else down++;
+      }
+    }
+    const total = up + down;
+    if (total < 8) return null;
+    const upPct = Math.round((up / total) * 100), downPct = Math.round((down / total) * 100);
+    return { upPct, downPct, sampleSize: total, margin: marginOfError(upPct, total), confidence: confidenceLabel(marginOfError(upPct, total)) };
+  })();
 
-  const pattern = historicalPatternStats(candles, { forwardSteps: 3 }); // ~15 min ahead
+  const session = getSessionInfo();
+  const newsWarnings = newsRiskWarning();
 
-  let votesUp = 0;
-  let votesDown = 0;
-  const reasons = [];
+  const lines = [`*${symbol} — Quick Signal (5min)*`, ``, `Price: ${price}`];
+  if (isForexMarketLikelyClosed()) lines.push('⚠️ Forex market is likely CLOSED right now (weekend) — won\'t match Quotex OTC prices.');
 
-  if (emaFast > emaSlow) { votesUp++; reasons.push('Short-term average (5) is above (20) — up momentum'); }
-  else { votesDown++; reasons.push('Short-term average (5) is below (20) — down momentum'); }
+  const directionLabel = ensemble.direction === 'UP' ? 'UP ⬆️' : ensemble.direction === 'DOWN' ? 'DOWN ⬇️' : 'UNCLEAR ↔️';
+  lines.push(
+    `Guess: *${directionLabel}*  (${ensemble.strength}% weighted agreement, ${ensemble.factorsUsed} factors used)`,
+    `Reasons (each auto-weighted by its OWN historical accuracy on this pair):`,
+    ...ensemble.reasons.map(r => `• ${r}`),
+    ``,
+  );
 
-  if (momentumUp) { votesUp++; reasons.push('Last few candles trending up'); }
-  else { votesDown++; reasons.push('Last few candles trending down'); }
-
-  if (rsi5 >= 60) { votesUp += 0.5; reasons.push('RSI leaning strong'); }
-  else if (rsi5 <= 40) { votesDown += 0.5; reasons.push('RSI leaning weak'); }
-
-  let patternLine = 'Not enough similar historical setups found for this pair yet.';
   if (pattern) {
-    // Weight the historical statistic like 2 votes — it's the most data-backed signal we have.
-    if (pattern.upPct > pattern.downPct) votesUp += 2;
-    else if (pattern.downPct > pattern.upPct) votesDown += 2;
-    patternLine = `In ${pattern.sampleSize} similar past setups (same RSI range + momentum) on this pair, price went UP ${pattern.upPct}% of the time and DOWN ${pattern.downPct}% of the time over the next ~${pattern.forwardSteps * 5} minutes.`;
+    lines.push(`📊 *Historical pattern:* In ${pattern.sampleSize} similar past setups, price went UP ${pattern.upPct}% / DOWN ${pattern.downPct}% over next ~15 min. Reliability: ${pattern.confidence} (±${pattern.margin}%).`, ``);
   }
 
-  const direction = votesUp > votesDown ? 'UP ⬆️' : votesDown > votesUp ? 'DOWN ⬇️' : 'UNCLEAR ↔️';
-  const total = votesUp + votesDown;
-  const strength = total > 0 ? Math.round((Math.max(votesUp, votesDown) / total) * 100) : 50;
+  lines.push(`🌍 Active sessions right now: ${session.active.join(', ') || 'none major'}`);
+  if (newsWarnings.length) lines.push(...newsWarnings.map(w => `📰 ${w}`));
 
-  const lines = [
-    `*${symbol} — Quick Signal (5min)*`,
-    ``,
-    `Price: ${price}`,
-    `Guess: *${direction}*  (${strength}% of signals agree)`,
-    `Reasons:`,
-    ...reasons.map(r => `• ${r}`),
-    ``,
-    `📊 *Historical pattern:* ${patternLine}`,
-    ``,
-    `⚠️ *Zaroori warning:* Itni choti timeframe (1-5 min) mein price movement bohot random hoti hai. Historical pattern stat bhi sirf "pehle kya hua tha" batata hai — future ki guarantee nahi deta. Professional traders bhi is duration ko high-risk mante hain. Apna paisa soch samajh kar lagayein.`,
-  ];
+  lines.push(``, `⚠️ *Zaroori warning:* Itni choti timeframe mein price movement bohot random hoti hai. Ye ensemble/history statistic hai, guarantee nahi. Apna paisa soch samajh kar lagayein.`);
 
-  return lines.join('\n');
+  return {
+    message: lines.join('\n'),
+    meta: { symbol, price, direction: ensemble.direction, forwardMinutes: 15 },
+  };
 }
 
 async function analyzePair(rawInput) {
   const symbol = normalizePair(rawInput);
-
-  // Only 4 API calls total per analysis (well under the 8/minute free-tier limit):
-  // 1 live quote + 3 candle series (1h, 4h, 1day). Every indicator (RSI, SMA
-  // trend, ATR, support/resistance, structure) is computed locally from the
-  // candle data instead of calling separate indicator endpoints.
   const [quote, candles1h, candles4h, candles1d] = await Promise.all([
-    fetchQuote(symbol),
-    fetchCandles(symbol, '1h', 60),
-    fetchCandles(symbol, '4h', 60),
-    fetchCandles(symbol, '1day', 60),
+    fetchQuote(symbol), fetchCandles(symbol, '1h', 60), fetchCandles(symbol, '4h', 60), fetchCandles(symbol, '1day', 60),
   ]);
-
   const price = parseFloat(quote.close);
   const changePct = parseFloat(quote.percent_change);
-
   const rsi1h = rsi(candles1h, 14);
   const atr1h = atr(candles1h, 14);
-  const trend1h = trendFromCandles(candles1h);
-  const trend4h = trendFromCandles(candles4h);
-  const trend1d = trendFromCandles(candles1d);
-
+  const trend1h = trendFromCandles(candles1h), trend4h = trendFromCandles(candles4h), trend1d = trendFromCandles(candles1d);
   const { support, resistance } = findSupportResistance(candles1h);
   const structure = detectStructure(candles1h);
   const { bias, confidence, reasons } = buildBias({ trend1h, trend4h, trend1d, structure, rsi1h });
+  const longStop = (price - atr1h * 1.5).toFixed(5), longTarget = (price + atr1h * 2).toFixed(5);
+  const shortStop = (price + atr1h * 1.5).toFixed(5), shortTarget = (price - atr1h * 2).toFixed(5);
 
-  const longStop = (price - atr1h * 1.5).toFixed(5);
-  const longTarget = (price + atr1h * 2).toFixed(5);
-  const shortStop = (price + atr1h * 1.5).toFixed(5);
-  const shortTarget = (price - atr1h * 2).toFixed(5);
-
-  const lines = [
-    `*${symbol} — Analysis*`,
-    ``,
-    `Price: ${price}  (${changePct}% today)`,
-    ``,
-    `*Bot's lean: ${bias}* (${confidence})`,
-    `Reasons:`,
-    ...reasons.map(r => `• ${r}`),
-    ``,
-    `RSI (1h): ${rsi1h.toFixed(2)} — ${interpretRSI(rsi1h)}`,
-    `Structure: ${structure}`,
-    `Resistance: ${resistance}  |  Support: ${support}`,
-    ``,
-    bias.includes('BUY')
-      ? `If you go long: Stop ${longStop} | Target ${longTarget}`
-      : bias.includes('SELL')
-        ? `If you go short: Stop ${shortStop} | Target ${shortTarget}`
-        : `No clean setup right now — waiting is a valid choice.`,
-    ``,
-    `_Ye bot ka data-based lean hai, guarantee nahi. Bot kabhi bhi galat ho sakta hai — final decision aapka hai. Stop-loss hamesha use karein._`,
-  ];
-
+  const lines = [`*${symbol} — Analysis*`, ``, `Price: ${price}  (${changePct}% today)`, ``];
+  if (isForexMarketLikelyClosed()) lines.push('⚠️ Forex market is likely CLOSED right now (weekend).', ``);
+  lines.push(
+    `*Bot's lean: ${bias}* (${confidence})`, `Reasons:`, ...reasons.map(r => `• ${r}`), ``,
+    `RSI (1h): ${rsi1h.toFixed(2)} — ${interpretRSI(rsi1h)}`, `Structure: ${structure}`,
+    `Resistance: ${resistance}  |  Support: ${support}`, ``,
+    bias.includes('BUY') ? `If you go long: Stop ${longStop} | Target ${longTarget}`
+      : bias.includes('SELL') ? `If you go short: Stop ${shortStop} | Target ${shortTarget}`
+      : `No clean setup right now — waiting is a valid choice.`,
+    ``, `_Ye bot ka data-based lean hai, guarantee nahi. Stop-loss hamesha use karein._`
+  );
   return lines.join('\n');
 }
 
-module.exports = { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, normalizePair };
+async function fullHistoryAnalysis(rawInput) {
+  const symbol = normalizePair(rawInput);
+  const [candles1h, candles4h, candles1d] = await Promise.all([
+    fetchCandles(symbol, '1h', 5000), fetchCandles(symbol, '4h', 5000), fetchCandles(symbol, '1day', 5000),
+  ]);
+  const price = candles1h[0].close;
+  const timeframes = [
+    { label: '1 Hour', candles: candles1h, forwardSteps: 4, forwardLabel: '~4 hours' },
+    { label: '4 Hour', candles: candles4h, forwardSteps: 3, forwardLabel: '~12 hours' },
+    { label: 'Daily', candles: candles1d, forwardSteps: 3, forwardLabel: '~3 days' },
+  ];
+  const lines = [`*${symbol} — Full History Analysis*`, ``, `Price: ${price}`, ``];
+  if (isForexMarketLikelyClosed()) lines.push('⚠️ Forex market is likely CLOSED right now (weekend).', ``);
+  lines.push(`Har timeframe ki poori history se pattern nikala gaya hai.`, ``);
+
+  let bullScore = 0, bearScore = 0;
+  const summaryReasons = [];
+  for (const tf of timeframes) {
+    const rsiVal = rsi(tf.candles, 14);
+    const trend = trendFromCandles(tf.candles);
+    const pattern = (function () {
+      const chronCandles = [...tf.candles].reverse();
+      const chron = chronCandles.map(c => c.close);
+      const rsiArr = rsiSeries(chron, 14), fastArr = smaSeries(chron, 5), slowArr = smaSeries(chron, 20);
+      const idx = chron.length - 1;
+      if (rsiArr[idx] === null) return null;
+      const bucket = Math.floor(rsiArr[idx] / 10), trendUp = fastArr[idx] > slowArr[idx];
+      let up = 0, down = 0;
+      for (let i = 20; i < chron.length - tf.forwardSteps; i++) {
+        if (rsiArr[i] === null) continue;
+        if (Math.floor(rsiArr[i] / 10) === bucket && (fastArr[i] > slowArr[i]) === trendUp) {
+          if (chron[i + tf.forwardSteps] > chron[i]) up++; else down++;
+        }
+      }
+      const total = up + down;
+      if (total < 8) return null;
+      const upPct = Math.round((up / total) * 100), downPct = Math.round((down / total) * 100);
+      return { upPct, downPct, sampleSize: total, margin: marginOfError(upPct, total), confidence: confidenceLabel(marginOfError(upPct, total)) };
+    })();
+
+    lines.push(`*${tf.label} timeframe:*`, `  Trend: ${trend} | RSI: ${rsiVal.toFixed(1)} — ${interpretRSI(rsiVal)}`);
+    if (pattern) {
+      lines.push(`  History: ${pattern.sampleSize} similar setups → UP ${pattern.upPct}% / DOWN ${pattern.downPct}% over next ${tf.forwardLabel}`, `  Reliability: ${pattern.confidence} (±${pattern.margin}%)`);
+      if (pattern.upPct > pattern.downPct) { bullScore++; summaryReasons.push(`${tf.label}: history leans UP (${pattern.upPct}%)`); }
+      else if (pattern.downPct > pattern.upPct) { bearScore++; summaryReasons.push(`${tf.label}: history leans DOWN (${pattern.downPct}%)`); }
+    } else {
+      lines.push(`  History: not enough similar past setups yet`);
+    }
+    lines.push(``);
+  }
+
+  let overall;
+  if (bullScore > bearScore) overall = `Overall lean: BUY (${bullScore}/${bullScore + bearScore} timeframes agree)`;
+  else if (bearScore > bullScore) overall = `Overall lean: SELL (${bearScore}/${bullScore + bearScore} timeframes agree)`;
+  else overall = `Overall lean: NO CLEAR AGREEMENT across timeframes`;
+  lines.push(`*${overall}*`, ...summaryReasons.map(r => `• ${r}`));
+  lines.push(``, `⚠️ Ye poori history ka statistic hai, guarantee nahi. Stop-loss zaroor use karein.`);
+  return lines.join('\n');
+}
+
+module.exports = {
+  analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis,
+  getKeyLevelsWithStats, backtestMethod, crossPairConfirmation, getSessionInfo,
+  normalizePair, isForexMarketLikelyClosed, fetchQuote,
+};
