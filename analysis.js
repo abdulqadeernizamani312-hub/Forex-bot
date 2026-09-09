@@ -272,11 +272,16 @@ function ensembleSignal(candlesNewestFirst, { forwardSteps = 3, period = 14, fas
     const currentVal = f.arr[n - 1];
     if (currentVal === null || currentVal === undefined) continue;
     const { accuracy, total } = factorAccuracy(chron, f.arr, forwardSteps);
-    const weight = Math.max(0, accuracy - 0.5);
-    if (weight <= 0.005) continue; // factor has no real historical edge for this pair, ignore it
+    // Give every fired factor at least a small baseline weight so a pair
+    // with no single strong factor doesn't collapse to a hard "UNCLEAR" —
+    // factors with a real historical edge (accuracy > 50%) get extra weight
+    // on top of that baseline.
+    const edge = Math.max(0, accuracy - 0.5);
+    const weight = 0.05 + edge;
     totalWeight += weight;
-    if (currentVal) { weightedUp += weight; reasons.push(`${f.name}: says UP (this factor's own historical accuracy: ${Math.round(accuracy * 100)}%, n=${total})`); }
-    else { weightedDown += weight; reasons.push(`${f.name}: says DOWN (this factor's own historical accuracy: ${Math.round(accuracy * 100)}%, n=${total})`); }
+    const edgeNote = edge > 0.01 ? `real edge, accuracy ${Math.round(accuracy * 100)}%` : `weak/no edge, accuracy ${Math.round(accuracy * 100)}%`;
+    if (currentVal) { weightedUp += weight; reasons.push(`${f.name}: says UP (${edgeNote}, n=${total})`); }
+    else { weightedDown += weight; reasons.push(`${f.name}: says DOWN (${edgeNote}, n=${total})`); }
   }
 
   const direction = weightedUp > weightedDown ? 'UP' : weightedDown > weightedUp ? 'DOWN' : 'UNCLEAR';
@@ -681,8 +686,88 @@ async function fullHistoryAnalysis(rawInput) {
   return lines.join('\n');
 }
 
+// Comprehensive multi-source analysis using up to ~7-8 API calls: micro
+// (1min), short (5min ensemble), and 3 higher timeframes (1h/4h/1day), plus
+// cross-pair confirmation. Combines everything into one verdict with an
+// honest "how many independent signals agree" confidence measure.
+async function masterAnalysis(rawInput) {
+  const symbol = normalizePair(rawInput);
+
+  const [candles1m, candles5m, candles1h, candles4h, candles1d] = await Promise.all([
+    fetchCandles(symbol, '1min', 1500),   // call 1
+    fetchCandles(symbol, '5min', 2000),   // call 2
+    fetchCandles(symbol, '1h', 500),      // call 3
+    fetchCandles(symbol, '4h', 500),      // call 4
+    fetchCandles(symbol, '1day', 500),    // call 5
+  ]);
+  const price = candles1m[0].close;
+
+  const crossInfo = await crossPairConfirmation(symbol); // calls 6-7 (best-effort)
+
+  const ensemble = ensembleSignal(candles5m, { forwardSteps: 3 });
+
+  const timeframeVerdicts = [];
+  const micro1mUp = sma(candles1m, 10) > sma(candles1m, 50);
+  timeframeVerdicts.push({ label: '1min micro-trend', up: micro1mUp });
+  timeframeVerdicts.push({ label: '5min ensemble', up: ensemble.direction === 'UP' ? true : ensemble.direction === 'DOWN' ? false : null });
+
+  const higherTFs = [
+    { label: '1 Hour', candles: candles1h, forwardSteps: 4 },
+    { label: '4 Hour', candles: candles4h, forwardSteps: 3 },
+    { label: 'Daily', candles: candles1d, forwardSteps: 3 },
+  ];
+  const tfDetails = [];
+  for (const tf of higherTFs) {
+    const trend = trendFromCandles(tf.candles);
+    const pattern = historicalPatternStats(tf.candles, { forwardSteps: tf.forwardSteps });
+    const up = pattern ? pattern.upPct > pattern.downPct : trend === 'UP';
+    timeframeVerdicts.push({ label: tf.label, up });
+    tfDetails.push({ label: tf.label, trend, pattern });
+  }
+
+  const agreeUp = timeframeVerdicts.filter(v => v.up === true).length;
+  const agreeDown = timeframeVerdicts.filter(v => v.up === false).length;
+  const totalOpinions = agreeUp + agreeDown;
+  const overallDirection = agreeUp > agreeDown ? 'UP' : agreeDown > agreeUp ? 'DOWN' : 'UNCLEAR';
+
+  const session = getSessionInfo();
+  const newsWarnings = newsRiskWarning();
+
+  const lines = [
+    `*${symbol} — Master Analysis*`, ``,
+    `Price: ${price}`,
+  ];
+  if (isForexMarketLikelyClosed()) lines.push('⚠️ Forex market is likely CLOSED right now (weekend).');
+  lines.push(
+    ``,
+    `*Overall: ${overallDirection}* (${agreeUp}/${totalOpinions} independent timeframes/signals agree)`,
+    ``,
+    `1min micro-trend: ${micro1mUp ? 'UP' : 'DOWN'}`,
+    `5min ensemble: ${ensemble.direction} (${ensemble.strength}% weighted, ${ensemble.factorsUsed} factors)`,
+  );
+  for (const d of tfDetails) {
+    if (d.pattern) {
+      lines.push(`${d.label}: trend ${d.trend}, history UP ${d.pattern.upPct}%/DOWN ${d.pattern.downPct}% (n=${d.pattern.sampleSize}, ${d.pattern.confidence})`);
+    } else {
+      lines.push(`${d.label}: trend ${d.trend} (not enough history for a pattern stat)`);
+    }
+  }
+  lines.push(``, `🌍 Active sessions: ${session.active.join(', ') || 'none major'}`);
+  if (newsWarnings.length) lines.push(...newsWarnings.map(w => `📰 ${w}`));
+  if (crossInfo && crossInfo.length) {
+    lines.push(``, `🔗 Related pairs:`, ...crossInfo.map(c => `  ${c.pair}: ${c.changePct > 0 ? '+' : ''}${c.changePct}% today`));
+  }
+
+  lines.push(
+    ``,
+    `⚠️ *Honest note:* Ye ${totalOpinions} alag-alag signals/timeframes ka combined view hai — jitne zyada agree karein, utna zyada "robust" hai. Lekin koi bhi combination guarantee nahi deta. Real accuracy jaanne ke liye !backtest ${rawInput} try karein — wahi is pair ka asli historical number dega.`
+  );
+
+  return lines.join('\n');
+}
+
 module.exports = {
   analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis,
   getKeyLevelsWithStats, backtestMethod, crossPairConfirmation, getSessionInfo,
-  normalizePair, isForexMarketLikelyClosed, fetchQuote,
+  masterAnalysis, normalizePair, isForexMarketLikelyClosed, fetchQuote,
 };

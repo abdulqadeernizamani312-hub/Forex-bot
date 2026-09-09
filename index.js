@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, isForexMarketLikelyClosed, fetchQuote, getKeyLevelsWithStats, backtestMethod, crossPairConfirmation } = require('./analysis');
+const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, isForexMarketLikelyClosed, fetchQuote, getKeyLevelsWithStats, backtestMethod, crossPairConfirmation, masterAnalysis } = require('./analysis');
 const axios = require('axios');
 
 const startTime = Date.now();
@@ -270,9 +270,23 @@ client.on('message', async (msg) => {
       '!watch EURUSD - key support/resistance level watch karo, auto-alert milega\n' +
       '!watchlist - abhi kya watch ho raha hai dekho\n' +
       '!unwatch EURUSD - watch hatao\n' +
-      '!backtest EURUSD - method ka real out-of-sample historical accuracy dekho\n\n' +
+      '!backtest EURUSD - method ka real out-of-sample historical accuracy dekho\n' +
+      '!master EURUSD - sabse detailed analysis (5 timeframes + cross-pair, ~7-8 API calls)\n\n' +
       'Supported shortcuts: EURUSD, GBPUSD, USDJPY, USDPKR, USDINR, AUDUSD, USDCAD, USDCHF, NZDUSD, EURGBP, XAUUSD'
     );
+    return;
+  }
+
+  const masterMatch = text.match(/^!master\s+(\S+)/i);
+  if (masterMatch) {
+    const pair = masterMatch[1];
+    try {
+      await msg.reply('⏳ Master analysis chal raha hai ' + pair.toUpperCase() + '... (5 timeframes + cross-pair, thoda time lagega)');
+      const result = await masterAnalysis(pair);
+      await msg.reply(result);
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message + '\n\nCheck the pair name or try !help');
+    }
     return;
   }
 
