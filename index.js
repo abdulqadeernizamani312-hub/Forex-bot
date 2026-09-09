@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, isForexMarketLikelyClosed, fetchQuote, getKeyLevelsWithStats, backtestMethod, crossPairConfirmation, masterAnalysis } = require('./analysis');
+const { analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis, isForexMarketLikelyClosed, fetchQuote, getKeyLevelsWithStats, backtestMethod, crossPairConfirmation, masterAnalysis, quickSignalCrypto, backtestMethodCrypto, analyzePairCrypto, fetchBinanceQuote } = require('./analysis');
 const axios = require('axios');
 
 const startTime = Date.now();
@@ -169,11 +169,12 @@ setInterval(async () => {
   const due = predictionLog.filter(p => !p.evaluated && now - p.createdAt >= p.forwardMinutes * 60 * 1000);
   if (due.length === 0) return;
 
-  const symbols = [...new Set(due.map(p => p.symbol))];
+  const bySymbol = {};
+  for (const p of due) bySymbol[p.symbol] = p.isCrypto || false;
   const prices = {};
-  for (const sym of symbols) {
+  for (const [sym, isCrypto] of Object.entries(bySymbol)) {
     try {
-      const q = await fetchQuote(sym);
+      const q = isCrypto ? await fetchBinanceQuote(sym) : await fetchQuote(sym);
       prices[sym] = parseFloat(q.close);
     } catch (e) {
       console.log('⚠️ Accuracy check: could not fetch price for', sym, e.message);
@@ -272,8 +273,53 @@ client.on('message', async (msg) => {
       '!unwatch EURUSD - watch hatao\n' +
       '!backtest EURUSD - method ka real out-of-sample historical accuracy dekho\n' +
       '!master EURUSD - sabse detailed analysis (5 timeframes + cross-pair, ~7-8 API calls)\n\n' +
+      '*Binance Crypto (BTC, ETH, etc.):*\n' +
+      '!canalyze BTC - crypto trend analysis + entry/SL/TP\n' +
+      '!csignal BTC - crypto quick signal (direction + risk sizing)\n' +
+      '!cbacktest BTC - crypto method backtest\n\n' +
       'Supported shortcuts: EURUSD, GBPUSD, USDJPY, USDPKR, USDINR, AUDUSD, USDCAD, USDCHF, NZDUSD, EURGBP, XAUUSD'
     );
+    return;
+  }
+
+  const canalyzeMatch = text.match(/^!canalyze\s+(\S+)/i);
+  if (canalyzeMatch) {
+    try {
+      await msg.reply('⏳ Crypto analysis fetch ho raha hai ' + canalyzeMatch[1].toUpperCase() + '...');
+      await msg.reply(await analyzePairCrypto(canalyzeMatch[1]));
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message);
+    }
+    return;
+  }
+
+  const cbacktestMatch = text.match(/^!cbacktest\s+(\S+)/i);
+  if (cbacktestMatch) {
+    try {
+      await msg.reply('⏳ Crypto backtest chal raha hai ' + cbacktestMatch[1].toUpperCase() + '...');
+      await msg.reply(await backtestMethodCrypto(cbacktestMatch[1]));
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message);
+    }
+    return;
+  }
+
+  const csignalMatch = text.match(/^!csignal\s+(\S+)/i);
+  if (csignalMatch) {
+    try {
+      await msg.reply('⏳ Crypto signal fetch ho raha hai ' + csignalMatch[1].toUpperCase() + '...');
+      const result = await quickSignalCrypto(csignalMatch[1]);
+      await msg.reply(result.message);
+      if (result.meta.direction !== 'UNCLEAR') {
+        predictionLog.push({
+          symbol: result.meta.symbol, entryPrice: result.meta.price, direction: result.meta.direction,
+          forwardMinutes: result.meta.forwardMinutes, createdAt: Date.now(), evaluated: false, isCrypto: true,
+        });
+        await savePredictionLog();
+      }
+    } catch (err) {
+      await msg.reply('❌ Error: ' + err.message);
+    }
     return;
   }
 

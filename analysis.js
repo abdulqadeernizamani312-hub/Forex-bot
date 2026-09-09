@@ -766,8 +766,183 @@ async function masterAnalysis(rawInput) {
   return lines.join('\n');
 }
 
+// ==================================================================
+// BINANCE FUTURES — crypto signals (public market data, no API key,
+// no trading — read-only). Reuses all the same analysis math above.
+// ==================================================================
+const BINANCE_BASE = 'https://fapi.binance.com';
+
+function normalizeCryptoSymbol(input) {
+  let clean = input.trim().toUpperCase().replace(/[\/\s]/g, '');
+  if (!clean.endsWith('USDT') && !clean.endsWith('USD') && !clean.endsWith('BUSD')) {
+    clean += 'USDT';
+  }
+  return clean;
+}
+
+async function fetchBinanceCandles(symbol, interval, limit = 500) {
+  const { data } = await axios.get(`${BINANCE_BASE}/fapi/v1/klines`, { params: { symbol, interval, limit } });
+  // Binance returns oldest -> newest; our convention elsewhere is newest -> oldest.
+  return data
+    .map(k => ({ time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]) }))
+    .reverse();
+}
+
+async function fetchBinanceQuote(symbol) {
+  const { data } = await axios.get(`${BINANCE_BASE}/fapi/v1/ticker/24hr`, { params: { symbol } });
+  return { close: parseFloat(data.lastPrice), percent_change: parseFloat(data.priceChangePercent) };
+}
+
+async function quickSignalCrypto(rawInput) {
+  const symbol = normalizeCryptoSymbol(rawInput);
+  const candles = await fetchBinanceCandles(symbol, '5m', 1500);
+  const price = candles[0].close;
+  const ensemble = ensembleSignal(candles, { forwardSteps: 3 });
+  const session = getSessionInfo();
+  const atrVal = atr(candles, 14);
+  const risk = riskManagementCalc(price, atrVal, 1);
+  const news = await fetchCryptoNews(symbol);
+
+  const lines = [
+    `*${symbol} (Binance Futures) — Quick Signal (5min)*`, ``, `Price: ${price}`,
+    `Guess: *${ensemble.direction === 'UP' ? 'UP ⬆️' : ensemble.direction === 'DOWN' ? 'DOWN ⬇️' : 'UNCLEAR ↔️'}*  (${ensemble.strength}% weighted, ${ensemble.factorsUsed} factors)`,
+    `Reasons:`, ...ensemble.reasons.map(r => `• ${r}`), ``,
+    `🌍 Active sessions: ${session.active.join(', ') || 'none major'}`,
+  ];
+  if (news.length) {
+    lines.push(``, `📰 *Recent news:*`, ...news.map(n => `• ${n.title}`));
+  }
+  lines.push(
+    ``,
+    `📐 *Risk sizing (educational, at ${risk.riskPercent}% risk-per-trade):*`,
+    `Stop distance: ~${risk.stopDistance.toFixed(price < 10 ? 6 : 2)} (${risk.stopDistancePct}% of price)`,
+    `Suggested max leverage cap: ~${risk.suggestedMaxLeverage}x (so a full stop-out costs only ~${risk.riskPercent}% of your account)`,
+    `_Ye ek generic formula hai (risk % ÷ stop distance %), tumhara actual risk tolerance/capital ke hisaab se adjust karna. Main financial advisor nahi hoon — final decision aapka hai._`,
+    ``,
+    `⚠️ Crypto 24/7 trade hota hai, volatility bohot zyada hoti hai. Ye history ka statistic hai, guarantee nahi. Sirf market data hai — koi trade khud nahi ki ja rahi.`,
+  );
+  return { message: lines.join('\n'), meta: { symbol, price, direction: ensemble.direction, forwardMinutes: 15 } };
+}
+
+async function predictAllDurationsCrypto(rawInput) {
+  const symbol = normalizeCryptoSymbol(rawInput);
+  const durations = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,30,40,50,60];
+  const candles = await fetchBinanceCandles(symbol, '1m', 1500);
+  const price = candles[0].close;
+  const stats = multiDurationStats(candles, durations);
+
+  const lines = [`*${symbol} (Binance Futures) — Multi-Duration Prediction*`, ``, `Price: ${price}`, ``];
+  if (!stats) {
+    lines.push('Not enough data right now.');
+  } else {
+    for (const d of durations) {
+      const s = stats[d];
+      if (!s) { lines.push(`${d}min: not enough historical samples yet`); continue; }
+      const lean = s.upPct > s.downPct ? 'UP' : s.upPct < s.downPct ? 'DOWN' : 'FLAT';
+      const tag = s.confidence.startsWith('High') ? 'H' : s.confidence.startsWith('Medium') ? 'M' : 'L';
+      lines.push(`${d}min: ${lean} (${tag}) — UP ${s.upPct}% / DOWN ${s.downPct}% (n=${s.sampleSize}, ±${s.margin}%)`);
+    }
+  }
+  lines.push(``, `⚠️ Sirf past data ka statistic hai, future ki guarantee nahi. Crypto volatility forex se zyada hoti hai.`);
+  return lines.join('\n');
+}
+
+async function backtestMethodCrypto(rawInput) {
+  const symbol = normalizeCryptoSymbol(rawInput);
+  const candles = await fetchBinanceCandles(symbol, '5m', 1500);
+  const result = backtestSetup(candles, { forwardSteps: 3 });
+
+  const lines = [
+    `*${symbol} (Binance Futures) — Backtest (out-of-sample, 5min/15min-ahead)*`, ``,
+    `Predictions made: ${result.predicted} (skipped ${result.skipped})`,
+    result.accuracyPct !== null ? `*Method accuracy: ${result.accuracyPct}%*` : 'Not enough data.',
+    result.baselinePct !== null ? `Naive baseline: ${result.baselinePct}%` : '',
+    result.accuracyPct !== null && result.baselinePct !== null
+      ? (result.accuracyPct > result.baselinePct ? `✅ Beat baseline by ${result.accuracyPct - result.baselinePct} points.` : `⚠️ Did NOT beat naive baseline — no real edge found right now.`)
+      : '',
+    ``, `⚠️ Single train/test split, past performance ki guarantee future ke liye nahi hoti.`,
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+async function analyzePairCrypto(rawInput) {
+  const symbol = normalizeCryptoSymbol(rawInput);
+  const [quote, candles1h, candles4h, candles1d] = await Promise.all([
+    fetchBinanceQuote(symbol), fetchBinanceCandles(symbol, '1h', 200), fetchBinanceCandles(symbol, '4h', 200), fetchBinanceCandles(symbol, '1d', 200),
+  ]);
+  const price = quote.close, changePct = quote.percent_change;
+  const rsi1h = rsi(candles1h, 14), atr1h = atr(candles1h, 14);
+  const trend1h = trendFromCandles(candles1h), trend4h = trendFromCandles(candles4h), trend1d = trendFromCandles(candles1d);
+  const { support, resistance } = findSupportResistance(candles1h);
+  const structure = detectStructure(candles1h);
+  const { bias, confidence, reasons } = buildBias({ trend1h, trend4h, trend1d, structure, rsi1h });
+  const longStop = (price - atr1h * 1.5).toFixed(2), longTarget = (price + atr1h * 2).toFixed(2);
+  const shortStop = (price + atr1h * 1.5).toFixed(2), shortTarget = (price - atr1h * 2).toFixed(2);
+  const risk = riskManagementCalc(price, atr1h, 1);
+  const news = await fetchCryptoNews(symbol);
+
+  const lines = [
+    `*${symbol} (Binance Futures) — Analysis*`, ``, `Price: ${price}  (${changePct}% today)`, ``,
+    `*Bot's lean: ${bias}* (${confidence})`, `Reasons:`, ...reasons.map(r => `• ${r}`), ``,
+    `RSI (1h): ${rsi1h.toFixed(2)} — ${interpretRSI(rsi1h)}`, `Structure: ${structure}`,
+    `Resistance: ${resistance}  |  Support: ${support}`, ``,
+    bias.includes('BUY') ? `If long: Stop ${longStop} | Target ${longTarget}`
+      : bias.includes('SELL') ? `If short: Stop ${shortStop} | Target ${shortTarget}`
+      : `No clean setup right now.`,
+  ];
+  if (news.length) lines.push(``, `📰 *Recent news:*`, ...news.map(n => `• ${n.title}`));
+  lines.push(
+    ``,
+    `📐 *Risk sizing (educational, at ${risk.riskPercent}% risk-per-trade):* Suggested max leverage ~${risk.suggestedMaxLeverage}x (stop distance ${risk.stopDistancePct}% of price). Generic formula — adjust to your own capital/risk tolerance.`,
+    ``, `⚠️ Ye sirf market data/analysis hai — koi trade khud nahi ki ja rahi. Guarantee nahi. Main financial advisor nahi hoon.`,
+  );
+  return lines.join('\n');
+}
+
+// Live crypto news (free, no API key: cryptocurrency.cv). Best-effort —
+// response shape wasn't verifiable from this sandbox (network restricted),
+// so this defensively tries a few common field names and silently returns
+// nothing on any mismatch rather than breaking the rest of the bot.
+async function fetchCryptoNews(tickerHint) {
+  try {
+    const { data } = await axios.get('https://cryptocurrency.cv/api/news', { timeout: 8000 });
+    const list = data.articles || data.results || data.news || (Array.isArray(data) ? data : []);
+    if (!Array.isArray(list) || list.length === 0) return [];
+    const hint = tickerHint.replace('USDT', '').replace('USD', '').toUpperCase();
+    const relevant = list.filter(item => {
+      const title = (item.title || item.headline || '').toUpperCase();
+      const currencies = (item.currencies || item.tickers || []).map(c => (typeof c === 'string' ? c : c.code || '').toUpperCase());
+      return title.includes(hint) || currencies.includes(hint);
+    });
+    const pick = (relevant.length > 0 ? relevant : list).slice(0, 3);
+    return pick.map(item => ({ title: item.title || item.headline || 'Untitled', url: item.url || item.link || null }));
+  } catch (e) {
+    return []; // best-effort — never break the calling command over this
+  }
+}
+
+// Educational risk-sizing calculator — NOT personalized financial advice.
+// Uses the standard "risk-per-trade" method: your stop-loss distance and how
+// much of your capital you're willing to risk together imply a sensible
+// leverage/position-size cap. riskPercent defaults to a conservative 1%.
+function riskManagementCalc(price, atrValue, riskPercent = 1) {
+  const stopDistance = atrValue * 1.5;
+  const stopDistancePct = (stopDistance / price) * 100;
+  const takeProfitDistance = atrValue * 3; // ~1:2 risk-reward
+  // If a full move to your stop-loss should only cost riskPercent% of your
+  // account, position size (in leverage terms) is capped around:
+  const suggestedMaxLeverage = stopDistancePct > 0 ? Math.max(1, Math.round((riskPercent / stopDistancePct) * 100)) : null;
+
+  return {
+    stopDistance, stopDistancePct: stopDistancePct.toFixed(2), takeProfitDistance,
+    suggestedMaxLeverage, riskPercent,
+  };
+}
+
 module.exports = {
   analyzePair, quickSignal, predictAllDurations, fullHistoryAnalysis,
   getKeyLevelsWithStats, backtestMethod, crossPairConfirmation, getSessionInfo,
   masterAnalysis, normalizePair, isForexMarketLikelyClosed, fetchQuote,
+  quickSignalCrypto, predictAllDurationsCrypto, backtestMethodCrypto, analyzePairCrypto, normalizeCryptoSymbol, fetchBinanceQuote,
+  fetchCryptoNews, riskManagementCalc,
 };
